@@ -189,7 +189,7 @@ class ImageFinder:
             if image_urls:
                 image_urls = _filter_urls(image_urls)
                 if image_urls:
-                    print(f"[ImageFinder] FC2PPV.stream 성공!")
+                    # 성공 메시지는 제거 (출력이 너무 많음)
                     return {
                         'thumbnail': image_urls[0],
                         'snapshots': []
@@ -270,24 +270,252 @@ class ImageFinder:
         # 문자 길이를 1~10자로 확장하여 다양한 케이스 지원
         pattern_av = r'([A-Z]{1,10})[-\s]?(\d{3,6})(?=[^\w]|$)'
         matches_av = re.findall(pattern_av, title_upper)
+        
+        # 제외할 키워드 목록 (코덱, 포맷, 프로토콜 등)
+        # FC2는 이미 별도 패턴으로 처리되므로 일반 패턴에서 제외
+        excluded_prefixes = {
+            'HTTP', 'HTTPS', 'HTML', 'URL', 'API', 'JPG', 'PNG', 'MP4', 'MKV', 
+            # 비디오 코덱/인코더
+            'H265', 'H264', 'H-265', 'H-264', 'HEVC', 'AVC',
+            'X265', 'X264', 'X-265', 'X-264',
+            # 기타 비디오 관련
+            '1080P', '1080', '720P', '720', '480P', '480',
+            '4K', 'UHD', 'HD',
+            'MPEG', 'MJPEG', 'DIVX', 'XVID',
+            # 오디오 코덱
+            'AAC', 'MP3', 'FLAC', 'OGG', 'VORBIS',
+            # 기타
+            'BLU', 'RAY', 'DVD', 'ISO', 'RAR', 'ZIP', '7Z'
+        }
+        
+        # 전체 코드 형태로도 제외할 목록 (코덱 정보 등)
+        excluded_codes = {
+            'H-265', 'H-264', 'H265', 'H264',
+            'X-265', 'X-264', 'X265', 'X264'
+        }
+        
         for match in matches_av:
             prefix, number = match
-            # 잘못된 매치 제외 (예: HTTP, HTTPS, HTML, PPV 등)
-            # PPV는 FC2-PPV 패턴의 일부이므로 제외
-            if prefix not in ['HTTP', 'HTTPS', 'HTML', 'URL', 'API', 'JPG', 'PNG', 'MP4', 'MKV', 'PPV', 'FC2']:
-                code = f"{prefix}-{number}"
-                codes.append(code)
+            # 전체 코드 형태 생성
+            code = f"{prefix}-{number}"
+            
+            # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
+            # prefix와 전체 code 모두 체크 (FC2는 이미 별도 패턴으로 처리되므로 제외)
+            if prefix not in excluded_prefixes and code.upper() not in excluded_codes:
+                # FC2는 이미 별도 패턴으로 처리했으므로 일반 패턴에서는 제외
+                if prefix == 'FC2':
+                    continue
+                # 숫자가 너무 작거나 크면 제외 (작품번호는 보통 3-6자리)
+                if len(number) >= 3 and len(number) <= 6:
+                    codes.append(code)
         
         # 중복 제거 (순서 유지)
         codes = list(dict.fromkeys(codes))
         
         # 디버그 출력
-        if codes:
-            print(f"[ImageFinder] 작품번호 추출: {', '.join(codes[:3])} (제목: {title[:50]}...)")
-        else:
-            print(f"[ImageFinder] 작품번호 추출 실패 (제목: {title[:50]}...)")
+        # 작품번호 추출 로그는 제거 (출력이 너무 많음)
         
         return codes[:3]  # 최대 3개
+    
+    def _search_fc2_adult_contents(self, fc2_number: str) -> dict:
+        """https://adult.contents.fc2.com/에서 FC2 번호로 썸네일 및 스냅샷 검색
+        
+        Args:
+            fc2_number: FC2 번호 (숫자만, 예: "4790416")
+        
+        Returns:
+            dict: {'thumbnail': str, 'snapshots': List[str]}
+        """
+        result = {'thumbnail': '', 'snapshots': []}
+        try:
+            # FC2 번호만 추출 (숫자만)
+            fc2_num = re.sub(r'[^\d]', '', fc2_number)
+            if not fc2_num or len(fc2_num) < 6:
+                return result
+            
+            # FC2 공식 사이트 URL (번호만 사용)
+            product_url = f"https://adult.contents.fc2.com/article/{fc2_num}/"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Referer': 'https://adult.contents.fc2.com/'
+            }
+            
+            try:
+                response = self._safe_get(product_url, headers=headers, timeout=self.http_timeout)
+                if response and response.status_code == 200:
+                    soup = BeautifulSoup(response.content, 'lxml')
+                else:
+                    # HTTP 실패 시 Selenium으로 시도
+                    if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                        return self._search_fc2_adult_contents_selenium(fc2_num)
+                    return result
+            except (ConnectionError, Timeout, RequestException) as e:
+                # 네트워크 오류 시 Selenium으로 시도
+                if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                    return self._search_fc2_adult_contents_selenium(fc2_num)
+                return result
+            
+            # 썸네일 찾기 (메인 이미지)
+            # 일반적으로 article 페이지에 있는 메인 이미지
+            thumbnail_selectors = [
+                'img.item_head_image',
+                'img.main_image',
+                '.item_head_image img',
+                '.main_image img',
+                'article img[src*="fc2.com"]',
+                'img[src*="thumbnail"]',
+                '.item_head img',
+                'img[src*="article"]'
+            ]
+            
+            for selector in thumbnail_selectors:
+                img = soup.select_one(selector)
+                if img:
+                    img_src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                    if img_src:
+                        if not img_src.startswith('http'):
+                            if img_src.startswith('//'):
+                                img_src = 'https:' + img_src
+                            elif img_src.startswith('/'):
+                                img_src = 'https://adult.contents.fc2.com' + img_src
+                            else:
+                                img_src = urljoin('https://adult.contents.fc2.com/', img_src)
+                        if img_src.startswith('http'):
+                            result['thumbnail'] = img_src
+                            # 찾은 경우에만 출력 (출력이 너무 많음)
+                            break
+            
+            # 스냅샷 찾기 (앨범 이미지들)
+            snapshot_selectors = [
+                '.snapshot img',
+                '.album img',
+                '.gallery img',
+                '.snapshots img',
+                'img[src*="snapshot"]',
+                'img[src*="album"]',
+                '.item_images img',
+                '.sample_images img'
+            ]
+            
+            for selector in snapshot_selectors:
+                images = soup.select(selector)
+                if images:
+                    for img in images:
+                        img_src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                        if img_src:
+                            if not img_src.startswith('http'):
+                                if img_src.startswith('//'):
+                                    img_src = 'https:' + img_src
+                                elif img_src.startswith('/'):
+                                    img_src = 'https://adult.contents.fc2.com' + img_src
+                                else:
+                                    img_src = urljoin('https://adult.contents.fc2.com/', img_src)
+                            if img_src.startswith('http') and img_src not in result['snapshots']:
+                                # 썸네일과 중복되지 않는 경우만 추가
+                                if img_src != result['thumbnail']:
+                                    result['snapshots'].append(img_src)
+                    
+                    if result['snapshots']:
+                        break
+            
+            return result
+            
+        except Exception as e:
+            # 오류 메시지는 출력하지 않음 (출력이 너무 많음)
+            return result
+    
+    def _search_fc2_adult_contents_selenium(self, fc2_num: str) -> dict:
+        """Selenium을 이용한 FC2 공식 사이트 검색 (HTTP 실패 시 대체)"""
+        result = {'thumbnail': '', 'snapshots': []}
+        if not (SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES):
+            return result
+        
+        try:
+            driver = self._get_selenium_driver()
+            self.selenium_use_count += 1
+            
+            product_url = f"https://adult.contents.fc2.com/article/{fc2_num}/"
+            driver.get(product_url)
+            
+            # 페이지 로딩 대기
+            try:
+                WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "img"))
+                )
+            except:
+                time.sleep(0.5)
+            
+            page_source = driver.page_source
+            soup = BeautifulSoup(page_source, 'lxml')
+            
+            # 썸네일 찾기
+            thumbnail_selectors = [
+                'img.item_head_image',
+                'img.main_image',
+                '.item_head_image img',
+                '.main_image img',
+                'article img[src*="fc2.com"]',
+                'img[src*="thumbnail"]',
+                '.item_head img',
+                'img[src*="article"]'
+            ]
+            
+            for selector in thumbnail_selectors:
+                img = soup.select_one(selector)
+                if img:
+                    img_src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                    if img_src:
+                        if not img_src.startswith('http'):
+                            if img_src.startswith('//'):
+                                img_src = 'https:' + img_src
+                            elif img_src.startswith('/'):
+                                img_src = 'https://adult.contents.fc2.com' + img_src
+                            else:
+                                img_src = urljoin('https://adult.contents.fc2.com/', img_src)
+                        if img_src.startswith('http'):
+                            result['thumbnail'] = img_src
+                            break
+            
+            # 스냅샷 찾기
+            snapshot_selectors = [
+                '.snapshot img',
+                '.album img',
+                '.gallery img',
+                '.snapshots img',
+                'img[src*="snapshot"]',
+                'img[src*="album"]',
+                '.item_images img',
+                '.sample_images img'
+            ]
+            
+            for selector in snapshot_selectors:
+                images = soup.select(selector)
+                if images:
+                    for img in images:
+                        img_src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                        if img_src:
+                            if not img_src.startswith('http'):
+                                if img_src.startswith('//'):
+                                    img_src = 'https:' + img_src
+                                elif img_src.startswith('/'):
+                                    img_src = 'https://adult.contents.fc2.com' + img_src
+                                else:
+                                    img_src = urljoin('https://adult.contents.fc2.com/', img_src)
+                            if img_src.startswith('http') and img_src not in result['snapshots']:
+                                if img_src != result['thumbnail']:
+                                    result['snapshots'].append(img_src)
+                    
+                    if result['snapshots']:
+                        break
+            
+            return result
+            
+        except Exception as e:
+            # 오류 메시지는 출력하지 않음
+            return result
     
     def _search_fc2ppv_stream(self, fc2_code: str) -> List[str]:
         """FC2PPV.stream에서 이미지 검색"""
@@ -361,14 +589,14 @@ class ImageFinder:
     def _search_javlibrary(self, code: str) -> List[str]:
         """JAVLibrary.com에서 이미지 검색"""
         try:
-            # JAVLibrary 검색 URL
-            search_url = f"https://www.javlibrary.com/en/vl_searchbyid.php?keyword={quote(code)}"
+            # JAVLibrary 검색 URL (일본어 버전)
+            search_url = f"https://www.javlibrary.com/ja/vl_searchbyid.php?keyword={quote(code)}"
             
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://www.javlibrary.com/'
+                'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+                'Referer': 'https://www.javlibrary.com/ja/'
             }
             
             response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
@@ -395,7 +623,7 @@ class ImageFinder:
                     elif href.startswith('http'):
                         video_url = href
                     else:
-                        video_url = urljoin('https://www.javlibrary.com', href)
+                        video_url = urljoin('https://www.javlibrary.com/ja/', href)
                     
                     # 상세 페이지에서 이미지 가져오기
                     detail_response = self._safe_get(video_url, headers=headers, timeout=self.http_timeout)
@@ -420,7 +648,7 @@ class ImageFinder:
                                     elif img_src.startswith('/'):
                                         img_src = 'https://www.javlibrary.com' + img_src
                                     else:
-                                        img_src = urljoin('https://www.javlibrary.com', img_src)
+                                        img_src = urljoin('https://www.javlibrary.com/ja/', img_src)
                                 image_urls.append(img_src)
                                 print(f"[ImageFinder] JAVLibrary에서 이미지 발견: {code}")
             
@@ -580,6 +808,122 @@ class ImageFinder:
             return image_urls[:1]  # 첫 번째 결과만 반환
             
         except Exception as e:
+            return []
+    
+    def _search_javmost(self, code: str) -> List[str]:
+        """javmost.com에서 이미지 검색"""
+        try:
+            # javmost.com 검색 URL (CODE 검색)
+            search_url = f"https://www5.javmost.com/search/{quote(code)}"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9,ja;q=0.8',
+                'Referer': 'https://www5.javmost.com/'
+            }
+            
+            try:
+                response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
+                if response and response.status_code == 200:
+                    soup = BeautifulSoup(response.content, 'lxml')
+                else:
+                    # HTTP 실패 시 Selenium으로 시도
+                    if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                        return self._search_javmost_selenium(code)
+                    return []
+            except (ConnectionError, Timeout, RequestException) as e:
+                # 네트워크 오류 시 Selenium으로 시도
+                if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                    return self._search_javmost_selenium(code)
+                return []
+            
+            image_urls = []
+            
+            # 작품 카드에서 이미지 찾기 (javmost.com 구조에 맞게)
+            video_cards = soup.find_all('div', class_='item')
+            if not video_cards:
+                video_cards = soup.find_all('div', class_='movie-item')
+            if not video_cards:
+                video_cards = soup.find_all('a', class_='box')
+            if not video_cards:
+                video_cards = soup.find_all('div', class_='video-item')
+            if not video_cards:
+                # javmost.com 특정 구조 시도
+                video_cards = soup.find_all('div', class_='thumbnail')
+            
+            if video_cards:
+                # 첫 번째 결과의 이미지
+                first_card = video_cards[0]
+                img = first_card.find('img')
+                if img:
+                    img_src = img.get('src', '') or img.get('data-src', '') or img.get('data-original', '') or img.get('data-lazy-src', '')
+                    if img_src:
+                        # 상대 URL 처리
+                        if not img_src.startswith('http'):
+                            if img_src.startswith('//'):
+                                img_src = 'https:' + img_src
+                            elif img_src.startswith('/'):
+                                img_src = 'https://www5.javmost.com' + img_src
+                            else:
+                                img_src = urljoin('https://www5.javmost.com/', img_src)
+                        if img_src.startswith('http'):
+                            image_urls.append(img_src)
+            
+            return image_urls
+            
+        except Exception as e:
+            # 오류 발생 시 Selenium으로 시도
+            if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                return self._search_javmost_selenium(code)
+            return []
+    
+    def _search_javmost_selenium(self, code: str) -> List[str]:
+        """Selenium을 이용한 javmost.com 검색 (통신 실패 시 대체)"""
+        if not (SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES):
+            return []
+        try:
+            driver = self._get_selenium_driver()
+            self.selenium_use_count += 1
+            
+            url = f"https://www5.javmost.com/search/{quote(code)}"
+            driver.get(url)
+            
+            # 최소 대기로 속도 개선
+            try:
+                WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.item, div.movie-item, a.box, div.video-item, div.thumbnail"))
+                )
+            except:
+                time.sleep(0.5)  # 실패 시에만 짧은 대기
+            
+            page_source = driver.page_source
+            soup = BeautifulSoup(page_source, 'lxml')
+            image_urls: List[str] = []
+            video_cards = soup.find_all('div', class_='item') or soup.find_all('div', class_='movie-item') or soup.find_all('a', class_='box') or soup.find_all('div', class_='video-item') or soup.find_all('div', class_='thumbnail')
+            if video_cards:
+                first = video_cards[0]
+                img = first.find('img')
+                if img:
+                    img_src = img.get('src') or img.get('data-src') or img.get('data-original') or img.get('data-lazy-src')
+                    if img_src and not img_src.startswith('http'):
+                        if img_src.startswith('//'):
+                            img_src = 'https:' + img_src
+                        elif img_src.startswith('/'):
+                            img_src = 'https://www5.javmost.com' + img_src
+                        else:
+                            img_src = urljoin('https://www5.javmost.com/', img_src)
+                    if img_src and img_src.startswith('http'):
+                        image_urls.append(img_src)
+            return image_urls
+        except Exception:
+            # 에러 발생 시 드라이버 재생성을 위해 None 설정
+            if self.selenium_driver:
+                try:
+                    self.selenium_driver.quit()
+                except:
+                    pass
+                self.selenium_driver = None
             return []
     
     def _search_javdb_selenium(self, code: str) -> List[str]:

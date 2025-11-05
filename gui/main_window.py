@@ -1,4 +1,5 @@
 """메인 윈도우"""
+import re
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPushButton, QProgressBar, QMessageBox, QStatusBar, QMenuBar, QMenu,
@@ -37,75 +38,125 @@ class ThumbnailUpdateThread(QThread):
         """업데이트 중단 요청"""
         self._stop_requested = True
     
-    def update_priority_ids(self, new_priority_ids: list):
-        """페이지 변경 시 우선순위 동적 업데이트 (썸네일 없는 항목 ID만 전달받음)"""
+    def update_priority_ids(self, new_priority_ids: list, force_first: bool = False):
+        """페이지 변경 시 우선순위 동적 업데이트 (썸네일 없는 항목 ID만 전달받음)
+        
+        Args:
+            new_priority_ids: 우선순위 ID 리스트
+            force_first: True이면 맨 앞에 강제로 추가 (썸네일 교체 버튼 클릭 시)
+        """
         if not hasattr(self, '_priority_lock') or self._priority_lock is None:
             return
         
         import threading
+        import queue
         with self._priority_lock:
-            # 새 우선순위 ID 추가 (순서 유지)
+            # 새 우선순위 ID 설정
             self.priority_ids = new_priority_ids
             
             if not self.priority_ids:
                 return
             
-            # 이미 처리 중인 항목에서 새로운 우선순위 항목이 있는지 확인
-            # SQLAlchemy 세션 상태 문제 방지를 위해 안전하게 ID 추출
-            existing_ids = set()
-            existing_priority = []
-            for t in self._torrents_to_process:
-                try:
-                    torrent_id = t.id
-                    existing_ids.add(torrent_id)
-                    if torrent_id in self.priority_ids:
-                        existing_priority.append(t)
-                except Exception:
-                    # 세션이 준비된 상태이거나 다른 문제로 접근 불가능한 경우 건너뛰기
-                    continue
+            # 병렬 처리 중이면 우선순위 큐에 직접 추가
+            if hasattr(self, 'priority_queue') and hasattr(self, 'main_queue') and hasattr(self, 'server_queues'):
+                # 기존 우선순위 큐의 항목들을 일반 큐로 이동
+                moved_count = 0
+                while not self.priority_queue.empty():
+                    try:
+                        item = self.priority_queue.get_nowait()
+                        # 우선순위 플래그 제거하고 일반 큐로 이동
+                        item['is_priority'] = False
+                        self.main_queue.put(item)
+                        moved_count += 1
+                    except queue.Empty:
+                        break
+                
+                if moved_count > 0:
+                    print(f"[썸네일] 기존 우선순위 항목 {moved_count}개를 일반 큐로 이동")
+                
+                # 현재 큐에 있는 항목 ID 확인 (중복 방지)
+                existing_ids = set()
+                
+                # main_queue에서 기존 항목 ID 확인
+                temp_items = []
+                while not self.main_queue.empty():
+                    try:
+                        item = self.main_queue.get_nowait()
+                        existing_ids.add(item['id'])
+                        temp_items.append(item)
+                    except queue.Empty:
+                        break
+                for item in temp_items:
+                    self.main_queue.put(item)
+                
+                # server_queues에서도 확인
+                for q in self.server_queues.values():
+                    temp_items = []
+                    while not q.empty():
+                        try:
+                            item = q.get_nowait()
+                            existing_ids.add(item['id'])
+                            temp_items.append(item)
+                        except queue.Empty:
+                            break
+                    for item in temp_items:
+                        q.put(item)
+                
+                # 현재 페이지의 모든 항목을 우선순위 큐에 추가 (이미 큐에 있어도 우선순위로)
+                # 1단계: 기존 큐에서 현재 페이지 항목 찾아서 우선순위 큐로 이동
+                priority_items_from_queue = []
+                
+                # main_queue에서 현재 페이지 항목 찾기
+                temp_items = []
+                while not self.main_queue.empty():
+                    try:
+                        item = self.main_queue.get_nowait()
+                        if item['id'] in self.priority_ids:
+                            # 현재 페이지 항목이면 우선순위 큐로 이동
+                            item['is_priority'] = True
+                            priority_items_from_queue.append(item)
+                        else:
+                            temp_items.append(item)
+                    except queue.Empty:
+                        break
+                # 일반 항목은 다시 main_queue에 넣기
+                for item in temp_items:
+                    self.main_queue.put(item)
+                
+                # server_queues에서도 현재 페이지 항목 찾기
+                for q in self.server_queues.values():
+                    temp_items = []
+                    while not q.empty():
+                        try:
+                            item = q.get_nowait()
+                            if item['id'] in self.priority_ids:
+                                # 현재 페이지 항목이면 우선순위 큐로 이동
+                                item['is_priority'] = True
+                                priority_items_from_queue.append(item)
+                            else:
+                                temp_items.append(item)
+                        except queue.Empty:
+                            break
+                    # 일반 항목은 다시 큐에 넣기
+                    for item in temp_items:
+                        q.put(item)
+                
+                # 2단계: DB에서 새 항목 가져오기 (큐에 없는 항목만)
+                new_ids = [id for id in self.priority_ids if id not in existing_ids]
             
-            # DB에서 아직 큐에 없는 새 항목들만 가져오기
-            new_ids = [id for id in self.priority_ids if id not in existing_ids]
-            
-            if new_ids:
-                session = self.db.get_session()
-                try:
-                    from database.models import Torrent
-                    
-                    # 새 항목들만 쿼리 (이미 썸네일 없는 항목만 전달받았으므로 조건 불필요)
-                    new_torrents = session.query(Torrent).filter(
-                        Torrent.id.in_(new_ids)
-                    ).all()
-                    
-                    # 전달받은 ID 순서대로 정렬 (self.priority_ids는 이미 순서가 있는 list)
-                    new_torrents_sorted = sorted(
-                        new_torrents,
-                        key=lambda t: self.priority_ids.index(t.id) if t.id in self.priority_ids else 999999
-                    )
-                    
-                    if new_torrents_sorted:
-                        print(f"[썸네일] 새 항목 {len(new_torrents_sorted)}개 추가")
-                    
-                    # 아직 처리하지 않은 항목들과 함께 재정렬
-                    if self._current_index < len(self._torrents_to_process):
-                        remaining = self._torrents_to_process[self._current_index:]
+                priority_items_from_db = []
+                if new_ids:
+                    session = self.db.get_session()
+                    try:
+                        from database.models import Torrent
                         
-                        # 우선순위 항목과 나머지 항목 분리
-                        priority_items = new_torrents_sorted.copy()  # 새 항목들
-                        other_items = []
+                        # 새 항목들만 쿼리
+                        new_torrents = session.query(Torrent).filter(
+                            Torrent.id.in_(new_ids),
+                            (Torrent.thumbnail_url == None) | (Torrent.thumbnail_url == '')
+                        ).all()
                         
-                        for item in remaining:
-                            try:
-                                item_id = item.id
-                                if item_id in self.priority_ids:
-                                    priority_items.append(item)
-                                else:
-                                    other_items.append(item)
-                            except Exception:
-                                # 세션 상태 문제로 접근 불가능한 경우 일반 항목으로 처리
-                                other_items.append(item)
-                        
-                        # 우선순위 순서대로 정렬 (self.priority_ids는 이미 순서가 있는 list)
+                        # priority_ids 순서대로 정렬
                         def safe_sort_key(t):
                             try:
                                 torrent_id = t.id
@@ -116,65 +167,86 @@ class ThumbnailUpdateThread(QThread):
                             except Exception:
                                 return 999999
                         
-                        priority_items_sorted = sorted(priority_items, key=safe_sort_key)
+                        new_torrents_sorted = sorted(new_torrents, key=safe_sort_key)
                         
-                        # 우선순위 항목을 앞으로
-                        self._torrents_to_process[self._current_index:] = priority_items_sorted + other_items
-                    else:
-                        # 모두 처리 완료 상태면 새 항목들을 뒤에 추가
-                        self._torrents_to_process.extend(new_torrents_sorted)
-                    
-                    
-                finally:
-                    session.close()
-            else:
-                # 기존 항목만 재정렬
-                if self._current_index < len(self._torrents_to_process) and existing_priority:
-                    remaining = self._torrents_to_process[self._current_index:]
-                    
-                    priority_items = []
-                    other_items = []
-                    
-                    for item in remaining:
-                        try:
-                            item_id = item.id
-                            if item_id in self.priority_ids:
-                                priority_items.append(item)
-                            else:
-                                other_items.append(item)
-                        except Exception:
-                            # 세션 상태 문제로 접근 불가능한 경우 일반 항목으로 처리
-                            other_items.append(item)
-                    
-                    # 우선순위 순서대로 정렬 (self.priority_ids는 이미 순서가 있는 list)
-                    def safe_sort_key(t):
-                        try:
-                            torrent_id = t.id
-                            if torrent_id in self.priority_ids:
-                                return self.priority_ids.index(torrent_id)
-                            else:
-                                return 999999
-                        except Exception:
+                        # 우선순위 항목을 딕셔너리로 변환
+                        for t in new_torrents_sorted:
+                            try:
+                                priority_items_from_db.append({
+                                    'id': t.id,
+                                    'title': t.title or '',
+                                    'thumbnail_url': t.thumbnail_url or '',
+                                    'is_priority': True
+                                })
+                            except Exception:
+                                continue
+                    finally:
+                        session.close()
+                
+                # 3단계: 모든 우선순위 항목을 priority_ids 순서대로 정렬하여 우선순위 큐에 추가
+                all_priority_items = priority_items_from_queue + priority_items_from_db
+                
+                # priority_ids 순서대로 정렬
+                def priority_sort_key(item):
+                    try:
+                        item_id = item['id']
+                        if item_id in self.priority_ids:
+                            return self.priority_ids.index(item_id)
+                        else:
                             return 999999
-                    
-                    priority_items_sorted = sorted(priority_items, key=safe_sort_key)
-                    
-                    self._torrents_to_process[self._current_index:] = priority_items_sorted + other_items
+                    except Exception:
+                        return 999999
+                
+                all_priority_items_sorted = sorted(all_priority_items, key=priority_sort_key)
+                
+                # 우선순위 큐에 추가 (중복 제거)
+                added_ids = set()
+                for item in all_priority_items_sorted:
+                    if item['id'] not in added_ids:
+                        if force_first:
+                            # force_first인 경우 (썸네일 교체 버튼) 맨 앞에 추가하려면
+                            # 임시로 모든 항목을 빼서 다시 넣어야 함
+                            temp_queue = queue.Queue()
+                            while not self.priority_queue.empty():
+                                try:
+                                    temp_queue.put(self.priority_queue.get_nowait())
+                                except queue.Empty:
+                                    break
+                            self.priority_queue.put(item)
+                            while not temp_queue.empty():
+                                try:
+                                    self.priority_queue.put(temp_queue.get_nowait())
+                                except queue.Empty:
+                                    break
+                        else:
+                            self.priority_queue.put(item)
+                        added_ids.add(item['id'])
+                
+                if all_priority_items_sorted:
+                    moved_count = len(priority_items_from_queue)
+                    new_count = len(priority_items_from_db)
+                    if moved_count > 0 and new_count > 0:
+                        print(f"[썸네일] 우선순위 큐 업데이트: 기존 큐에서 {moved_count}개 이동, 새 항목 {new_count}개 추가")
+                    elif moved_count > 0:
+                        print(f"[썸네일] 우선순위 큐 업데이트: 기존 큐에서 {moved_count}개 이동")
+                    elif new_count > 0:
+                        print(f"[썸네일] 우선순위 큐 업데이트: 새 항목 {new_count}개 추가")
     
     def run(self):
-        """썸네일 없는 항목 찾아서 업데이트"""
+        """썸네일 없는 항목 찾아서 업데이트 (서버별 스레드 1개씩)"""
         try:
             self._stop_requested = False
             updated_count = 0
             
             # 스레드 락 초기화
             import threading
+            import queue
             self._priority_lock = threading.Lock()
+            self._update_lock = threading.Lock()  # updated_count 동기화용
             
-            # 썸네일 검색기 초기화
+            # 썸네일 검색 기능 확인
             try:
                 from scrapers.image_finder import ThumbnailEnhancer
-                thumbnail_enhancer = ThumbnailEnhancer()
             except ImportError:
                 print("[썸네일] 이미지 검색 기능 사용 불가")
                 self.error.emit("이미지 검색 기능을 사용할 수 없습니다.")
@@ -231,72 +303,623 @@ class ThumbnailUpdateThread(QThread):
                     self.finished.emit(0)
                     return
                 
-                print(f"[썸네일] {total}개 항목 검색 시작")
-                
-                for idx, torrent in enumerate(self._torrents_to_process):
-                    self._current_index = idx
-                    
-                    if self._stop_requested:
-                        print(f"\n[썸네일] 사용자에 의해 중단됨 ({idx}/{total})")
-                        break
-                    
-                    # 진행 상황 (같은 줄 업데이트)
-                    print(f"\r[썸네일] 검색 중... {idx + 1}/{total} (업데이트: {updated_count})", end='', flush=True)
-                    self.progress.emit(
-                        int(((idx + 1) / total) * 100),
-                        f"썸네일 검색 중... {idx + 1}/{total}"
-                    )
-                    
-                    # 썸네일 검색
-                    torrent_data = {
-                        'title': torrent.title,
-                        'thumbnail_url': torrent.thumbnail_url
-                    }
-                    
+                # ID와 제목만 저장 (세션 객체는 스레드 안전하지 않음)
+                torrent_items = []
+                for t in self._torrents_to_process:
                     try:
-                        updated_data = thumbnail_enhancer.enhance_torrent(torrent_data)
-                        
-                        # 썸네일이 발견되면 업데이트
-                        if updated_data.get('thumbnail_url') and updated_data['thumbnail_url'] != torrent.thumbnail_url:
-                            # commit 전에 필요한 값 저장 (commit 후 lazy loading 에러 방지)
-                            torrent_id = torrent.id
-                            is_priority = torrent_id in self.priority_ids
-                            
-                            torrent.thumbnail_url = updated_data['thumbnail_url']
-                            if updated_data.get('snapshot_urls'):
-                                torrent.snapshot_urls = updated_data['snapshot_urls']
-                            
-                            session.flush()  # commit 대신 flush 사용
-                            updated_count += 1
-                            
-                            # 10개마다 중간 커밋 (프로그램 종료 시 데이터 손실 방지)
-                            if updated_count % 10 == 0:
-                                try:
-                                    session.commit()
-                                except Exception as commit_err:
-                                    print(f"\n[썸네일] 중간 커밋 오류: {commit_err}")
-                                    session.rollback()
-                            
-                            # 현재 페이지 항목이면 GUI 즉시 업데이트
-                            if is_priority:
-                                self.thumbnail_updated.emit(torrent_id, updated_data['thumbnail_url'])
-                    except Exception as e:
-                        # 오류는 조용히 처리
+                        torrent_items.append({
+                            'id': t.id,
+                            'title': t.title or '',
+                            'thumbnail_url': t.thumbnail_url or '',
+                            'is_priority': t.id in self.priority_ids
+                        })
+                    except Exception:
                         continue
                 
+                session.close()  # 메인 세션 종료
+                
+                # 병렬 처리 중임을 표시 (update_priority_ids에서 사용)
+                self._current_index = -1
+                
+                print(f"[썸네일] {total}개 항목 검색 시작 (서버별 병렬 처리)")
+                
+                # 우선순위 큐 생성 (현재 페이지 항목 우선)
+                priority_queue = queue.Queue()
+                priority_items = [item for item in torrent_items if item.get('is_priority', False)]
+                if priority_items:
+                    # 우선순위 항목을 priority_ids 순서대로 정렬
+                    priority_items_sorted = sorted(
+                        priority_items,
+                        key=lambda x: self.priority_ids.index(x['id']) if x['id'] in self.priority_ids else 999999
+                    )
+                    for item in priority_items_sorted:
+                        priority_queue.put(item)
+                    print(f"[썸네일] 우선순위 큐에 {len(priority_items_sorted)}개 항목 추가")
+                else:
+                    print(f"[썸네일] 우선순위 항목 없음 (priority_ids: {self.priority_ids})")
+                
+                # 공통 대기열 생성 (나머지 작업)
+                # 일반 큐 생성 (FC2 포함 모든 항목)
+                main_queue = queue.Queue()
+                
+                for item in torrent_items:
+                    if item.get('is_priority', False):
+                        continue  # 우선순위 항목은 이미 priority_queue에 있음
+                    
+                    # 모든 항목을 main_queue에 추가
+                    main_queue.put(item)
+                
+                # 서버별 재시도 큐 생성 (한 서버에서 못 찾으면 다른 서버로)
+                server_queues = {
+                    'missav': queue.Queue(),
+                    'javlibrary': queue.Queue(),
+                    'javdb': queue.Queue(),
+                    'javmost': queue.Queue(),
+                    'fc2ppv': queue.Queue()  # FC2 재시도 큐
+                }
+                
+                # update_priority_ids에서 접근할 수 있도록 저장
+                self.priority_queue = priority_queue
+                self.main_queue = main_queue
+                self.server_queues = server_queues
+                
+                # 토렌트별 처리 상태 추적
+                torrent_status = {}  # {torrent_id: {'found': bool, 'thumbnail_url': str, 'tried_servers': set}}
+                status_lock = threading.Lock()
+                
+                # 완료된 토렌트 추적 (진행 상황 계산용)
+                completed_torrents = set()  # 완료된 torrent_id 집합
+                completed_lock = threading.Lock()
+                
+                # 서버별 검색 함수 (각 서버 전용)
+                def search_server_specific(title: str, server: str, exclude_hosts: list = None):
+                    """특정 서버에서만 검색"""
+                    import re
+                    from scrapers.image_finder import ImageFinder
+                    finder = ImageFinder()
+                    
+                    codes = finder._extract_codes(title)
+                    
+                    # FC2 코드 추출 (FC2 관련 제목인지 확인)
+                    fc2_codes = []
+                    is_fc2_title = False
+                    pattern_fc2 = r'FC2[-\s]?PPV[-\s]?(\d{6,8})'
+                    matches = re.findall(pattern_fc2, title.upper())
+                    if matches:
+                        fc2_codes = matches[:1]
+                        is_fc2_title = True
+                    
+                    # FC2 관련 제목인지 추가 확인 (FC2PPV, FC2 PPV 등)
+                    if not is_fc2_title:
+                        fc2_patterns = [
+                            r'FC2[-\s]?PPV',
+                            r'FC2PPV',
+                            r'FC2\s+PPV'
+                        ]
+                        for pattern in fc2_patterns:
+                            if re.search(pattern, title.upper()):
+                                is_fc2_title = True
+                                # 숫자만 추출
+                                num_match = re.search(r'(\d{6,8})', title)
+                                if num_match:
+                                    fc2_codes = [num_match.group(1)]
+                                break
+                    
+                    image_urls = []
+                    
+                    # FC2 공식 사이트 검색 (FC2 관련 제목에서만, 최우선)
+                    if is_fc2_title and fc2_codes and server == 'fc2ppv':
+                        for fc2_code in fc2_codes:
+                            fc2_result = finder._search_fc2_adult_contents(fc2_code)
+                            if fc2_result.get('thumbnail'):
+                                image_urls.append(fc2_result['thumbnail'])
+                                # 스냅샷도 저장할 수 있지만 현재는 썸네일만
+                                if image_urls:
+                                    break
+                    
+                    # 1단계: 작품번호로 검색 (있는 경우, FC2가 아닌 경우)
+                    if not is_fc2_title and codes:
+                        if server == 'missav':
+                            from config import ENABLE_SELENIUM_FOR_IMAGES
+                            if ENABLE_SELENIUM_FOR_IMAGES:
+                                for code in codes:
+                                    urls = finder._search_missav_selenium(code)
+                                    image_urls.extend(urls)
+                                    if image_urls:
+                                        break
+                        elif server == 'javlibrary':
+                            for code in codes:
+                                urls = finder._search_javdatabase(code)
+                                image_urls.extend(urls)
+                                if image_urls:
+                                    break
+                        elif server == 'javdb':
+                            from config import ENABLE_SELENIUM_FOR_IMAGES
+                            if ENABLE_SELENIUM_FOR_IMAGES:
+                                for code in codes:
+                                    urls = finder._search_javdb_selenium(code)
+                                    image_urls.extend(urls)
+                                    if image_urls:
+                                        break
+                            else:
+                                for code in codes:
+                                    urls = finder._search_javdb(code)
+                                    image_urls.extend(urls)
+                                    if image_urls:
+                                        break
+                        elif server == 'javmost':
+                            for code in codes:
+                                urls = finder._search_javmost(code)
+                                image_urls.extend(urls)
+                                if image_urls:
+                                    break
+                    
+                    # FC2PPV.stream 검색 (백업용, FC2 공식 사이트에서 못 찾은 경우)
+                    if is_fc2_title and fc2_codes and server == 'fc2ppv' and not image_urls:
+                        for fc2_code in fc2_codes:
+                            urls = finder._search_fc2ppv_stream(fc2_code)
+                            image_urls.extend(urls)
+                            if image_urls:
+                                break
+                    
+                    # 2단계: 작품번호로 못 찾았으면 (또는 작품번호가 없으면) 전체 제목으로 검색
+                    if not image_urls:
+                        if server == 'missav':
+                            from config import ENABLE_SELENIUM_FOR_IMAGES
+                            if ENABLE_SELENIUM_FOR_IMAGES:
+                                urls = finder._search_missav_selenium(title)
+                                image_urls.extend(urls)
+                        elif server == 'javlibrary':
+                            urls = finder._search_javdatabase(title)
+                            image_urls.extend(urls)
+                        elif server == 'javdb':
+                            from config import ENABLE_SELENIUM_FOR_IMAGES
+                            if ENABLE_SELENIUM_FOR_IMAGES:
+                                urls = finder._search_javdb_selenium(title)
+                                image_urls.extend(urls)
+                            else:
+                                urls = finder._search_javdb(title)
+                                image_urls.extend(urls)
+                        elif server == 'javmost':
+                            urls = finder._search_javmost(title)
+                            image_urls.extend(urls)
+                        # FC2는 작품번호로만 검색 (전체 제목 검색 안 함)
+                    
+                    # 필터링
+                    def _filter_urls(urls):
+                        filtered = []
+                        for u in urls:
+                            if not u or finder._is_blocked_thumbnail(u):
+                                continue
+                            if exclude_hosts:
+                                try:
+                                    from urllib.parse import urlparse
+                                    host = urlparse(u).netloc.lower()
+                                    if any((ex or '').lower() in host for ex in exclude_hosts):
+                                        continue
+                                except:
+                                    pass
+                            if u not in filtered:
+                                filtered.append(u)
+                        return filtered
+                    
+                    image_urls = _filter_urls(image_urls)
+                    return image_urls[0] if image_urls else ''
+                
+                # 서버별 스레드 실행 함수
+                def server_worker(priority_q: queue.Queue, server_name: str, source_queues: list, other_queues: list):
+                    """서버별 워커 스레드 (각 서버당 1개씩만 실행, 병렬 처리)"""
+                    nonlocal updated_count  # 외부 스코프의 updated_count에 접근
+                    
+                    # FC2 패턴
+                    fc2_patterns = [
+                        r'FC2[-\s]?PPV[-\s]?(\d{6,8})',
+                        r'FC2[-\s]?PPV',
+                        r'FC2PPV',
+                        r'FC2\s+PPV'
+                    ]
+                    
+                    def is_fc2_title(title: str) -> bool:
+                        """제목이 FC2 관련인지 확인"""
+                        title_upper = title.upper()
+                        for pattern in fc2_patterns:
+                            if re.search(pattern, title_upper):
+                                return True
+                        return False
+                    
+                    while not self._stop_requested:
+                        item = None
+                        used_queue = None
+                        
+                        # FC2 서버는 우선순위/일반 큐에서 FC2 항목만 가져오기
+                        if server_name == 'fc2ppv':
+                            # 재시도 큐 먼저 확인
+                            try:
+                                item = server_queues['fc2ppv'].get_nowait()
+                                used_queue = server_queues['fc2ppv']
+                                # print(f"[{server_name.upper()}] 재시도 큐에서 항목 가져옴: {item.get('title', '')[:50]}")
+                            except queue.Empty:
+                                # 우선순위 큐에서 FC2 항목 찾기
+                                temp_items = []
+                                found_fc2 = False
+                                while not priority_q.empty():
+                                    try:
+                                        temp_item = priority_q.get_nowait()
+                                        if is_fc2_title(temp_item.get('title', '')):
+                                            item = temp_item
+                                            used_queue = priority_q
+                                            found_fc2 = True
+                                            break
+                                        else:
+                                            temp_items.append(temp_item)
+                                    except queue.Empty:
+                                        break
+                                
+                                # FC2가 아닌 항목은 다시 우선순위 큐로
+                                for ti in temp_items:
+                                    priority_q.put(ti)
+                                
+                                # 우선순위 큐에서 못 찾았으면 일반 큐에서 찾기
+                                if not found_fc2:
+                                    temp_items = []
+                                    for source_queue in source_queues:
+                                        if source_queue == priority_q:
+                                            continue  # 이미 확인함
+                                        while not source_queue.empty():
+                                            try:
+                                                temp_item = source_queue.get_nowait()
+                                                if is_fc2_title(temp_item.get('title', '')):
+                                                    item = temp_item
+                                                    used_queue = source_queue
+                                                    found_fc2 = True
+                                                    break
+                                                else:
+                                                    temp_items.append((source_queue, temp_item))
+                                            except queue.Empty:
+                                                break
+                                        if found_fc2:
+                                            break
+                                    
+                                    # FC2가 아닌 항목은 다시 큐로
+                                    for queue_obj, ti in temp_items:
+                                        queue_obj.put(ti)
+                            
+                            if item is None:
+                                # FC2 항목을 찾지 못했으면 잠시 대기 후 재시도
+                                import time
+                                time.sleep(0.1)
+                                continue
+                        else:
+                            # 다른 서버는 우선순위 큐와 main_queue 확인
+                            # 우선순위 큐를 먼저 확인 (현재 페이지 항목 우선)
+                            try:
+                                item = priority_q.get_nowait()  # non-blocking으로 즉시 확인
+                                used_queue = priority_q
+                            except queue.Empty:
+                                # 우선순위 큐가 비어있으면 소스 큐들 확인
+                                for source_queue in source_queues:
+                                    try:
+                                        item = source_queue.get(timeout=0.5)
+                                        used_queue = source_queue
+                                        break
+                                    except queue.Empty:
+                                        continue
+                                
+                                # 소스 큐도 비어있으면 우선순위 큐를 다시 확인 (blocking)
+                                if item is None:
+                                    try:
+                                        item = priority_q.get(timeout=1.0)  # 우선순위 큐를 더 오래 기다림
+                                        used_queue = priority_q
+                                    except queue.Empty:
+                                        pass
+                            
+                            if item is None:
+                                # 모든 큐가 비어있으면 종료
+                                break
+                            
+                            # 다른 서버는 FC2 항목을 만나면 스킵하고 다시 큐에 넣거나 다른 서버로 넘기기
+                            if is_fc2_title(item.get('title', '')):
+                                # FC2 항목은 FC2 서버 큐로 넘기기
+                                used_queue.task_done() if hasattr(used_queue, 'task_done') else None
+                                try:
+                                    server_queues['fc2ppv'].put(item)
+                                except:
+                                    pass
+                                continue
+                            
+                            # 디버그: 다른 서버가 항목을 처리할 때 로그 출력 (처음 몇 개만)
+                            if not hasattr(server_worker, '_debug_count'):
+                                server_worker._debug_count = {}
+                            if server_name not in server_worker._debug_count:
+                                server_worker._debug_count[server_name] = 0
+                            if server_worker._debug_count[server_name] < 3:
+                                print(f"[{server_name.upper()}] 항목 처리 시작: {item.get('title', '')[:50]}")
+                                server_worker._debug_count[server_name] += 1
+                        
+                        if item is None:
+                            # 모든 큐가 비어있으면 종료
+                            break
+                        
+                        torrent_id = item['id']
+                        title = item['title']
+                        is_priority = item['is_priority']
+                        exclude_hosts = item.get('exclude_hosts', [])
+                        
+                        # 이미 다른 서버에서 찾았는지 확인
+                        with status_lock:
+                            if torrent_id in torrent_status and torrent_status[torrent_id].get('found'):
+                                # 이미 찾았으면 스킵
+                                with completed_lock:
+                                    completed_torrents.add(torrent_id)
+                                used_queue.task_done()
+                                continue
+                            
+                            # 이미 이 서버에서 시도했는지 확인
+                            if torrent_id in torrent_status:
+                                tried = torrent_status[torrent_id].get('tried_servers', set())
+                                if server_name in tried:
+                                    # 이미 시도했으면 스킵
+                                    used_queue.task_done()
+                                    continue
+                        
+                        try:
+                            # 독립적인 세션 생성
+                            work_session = self.db.get_session()
+                            try:
+                                from database.models import Torrent
+                                torrent = work_session.get(Torrent, torrent_id)
+                                if not torrent:
+                                    used_queue.task_done()
+                                    continue
+                                
+                                # 이미 썸네일이 있으면 스킵
+                                if torrent.thumbnail_url and torrent.thumbnail_url.strip():
+                                    with status_lock:
+                                        torrent_status[torrent_id] = {'found': True, 'thumbnail_url': torrent.thumbnail_url, 'tried_servers': set()}
+                                    with completed_lock:
+                                        completed_torrents.add(torrent_id)
+                                    used_queue.task_done()
+                                    continue
+                                
+                                # 현재 서버에서 검색
+                                thumbnail_url = search_server_specific(title, server_name, exclude_hosts)
+                                
+                                # 디버그: 검색 결과 확인 (처음 몇 개만)
+                                if not hasattr(server_worker, '_search_debug_count'):
+                                    server_worker._search_debug_count = {}
+                                if server_name not in server_worker._search_debug_count:
+                                    server_worker._search_debug_count[server_name] = 0
+                                if server_worker._search_debug_count[server_name] < 3:
+                                    if thumbnail_url:
+                                        print(f"[{server_name.upper()}] 검색 성공: {title[:50]}...")
+                                    else:
+                                        print(f"[{server_name.upper()}] 검색 실패: {title[:50]}...")
+                                    server_worker._search_debug_count[server_name] += 1
+                                
+                                # 다시 한번 확인 (다른 서버에서 이미 찾았을 수 있음)
+                                with status_lock:
+                                    if torrent_id in torrent_status and torrent_status[torrent_id].get('found'):
+                                        used_queue.task_done()
+                                        continue
+                                
+                                if thumbnail_url:
+                                    # 찾은 경우에만 출력
+                                    priority_mark = "[우선순위] " if is_priority else ""
+                                    print(f"[{server_name.upper()}] {priority_mark}썸네일 발견: {title[:50]}... ({thumbnail_url[:60]}...)")
+                                    
+                                    # 썸네일 발견 - 상태 업데이트 및 DB 저장
+                                    try:
+                                        with status_lock:
+                                            # 이미 다른 서버에서 찾았는지 재확인
+                                            if torrent_id in torrent_status and torrent_status[torrent_id].get('found'):
+                                                used_queue.task_done()
+                                                continue
+                                            
+                                            torrent_status[torrent_id] = {'found': True, 'thumbnail_url': thumbnail_url, 'tried_servers': set()}
+                                        
+                                        # DB에 저장
+                                        torrent.thumbnail_url = thumbnail_url
+                                        work_session.commit()
+                                        
+                                        # 업데이트 카운트 증가
+                                        with self._update_lock:
+                                            updated_count += 1
+                                            # 디버그: 업데이트 카운트 증가 확인
+                                            # print(f"[{server_name.upper()}] DB 저장 완료 (ID: {torrent_id}), 업데이트 카운트: {updated_count}")
+                                        
+                                        # 완료된 토렌트로 표시
+                                        with completed_lock:
+                                            completed_torrents.add(torrent_id)
+                                        
+                                        # 현재 페이지 항목이면 GUI 즉시 업데이트
+                                        if is_priority:
+                                            self.thumbnail_updated.emit(torrent_id, thumbnail_url)
+                                        
+                                        used_queue.task_done()
+                                    except Exception as commit_error:
+                                        # DB 저장 실패 시 로그 출력 및 다른 서버로 넘기기
+                                        print(f"[{server_name.upper()}] DB 저장 실패 (ID: {torrent_id}): {commit_error}")
+                                        work_session.rollback()
+                                        # 다른 서버로 넘기기
+                                        with status_lock:
+                                            if torrent_id not in torrent_status:
+                                                torrent_status[torrent_id] = {'found': False, 'tried_servers': {server_name}}
+                                            else:
+                                                torrent_status[torrent_id]['tried_servers'].add(server_name)
+                                            
+                                            tried_servers = torrent_status[torrent_id].get('tried_servers', set())
+                                            all_servers = {'missav', 'javlibrary', 'javdb', 'javmost', 'fc2ppv'}
+                                            remaining_servers = all_servers - tried_servers
+                                            
+                                            if remaining_servers:
+                                                for other_server in remaining_servers:
+                                                    if other_server in server_queues:
+                                                        try:
+                                                            item_copy = item.copy()
+                                                            item_copy['exclude_hosts'] = exclude_hosts
+                                                            server_queues[other_server].put(item_copy)
+                                                            break
+                                                        except:
+                                                            pass
+                                        
+                                        used_queue.task_done()
+                                else:
+                                    # 현재 서버에서 못 찾음 - 다른 서버 큐로 넘기기
+                                    # 디버그: 못 찾았을 때 로그 출력 (처음 몇 개만)
+                                    if not hasattr(server_worker, '_not_found_count'):
+                                        server_worker._not_found_count = {}
+                                    if server_name not in server_worker._not_found_count:
+                                        server_worker._not_found_count[server_name] = 0
+                                    if server_worker._not_found_count[server_name] < 3:
+                                        print(f"[{server_name.upper()}] 썸네일 없음: {title[:50]}...")
+                                        server_worker._not_found_count[server_name] += 1
+                                    
+                                    with status_lock:
+                                        if torrent_id not in torrent_status:
+                                            torrent_status[torrent_id] = {'found': False, 'tried_servers': {server_name}}
+                                        else:
+                                            torrent_status[torrent_id]['tried_servers'].add(server_name)
+                                        
+                                        tried_servers = torrent_status[torrent_id].get('tried_servers', set())
+                                        
+                                        # 아직 시도하지 않은 다른 서버 큐에 추가
+                                        # FC2 서버에서 못 찾았으면 다른 서버도 시도
+                                        all_servers = {'missav', 'javlibrary', 'javdb', 'javmost', 'fc2ppv'}
+                                        remaining_servers = all_servers - tried_servers
+                                        
+                                        if remaining_servers:
+                                            # 다른 서버 큐에 추가
+                                            for other_server in remaining_servers:
+                                                if other_server in server_queues:
+                                                    item_copy = item.copy()
+                                                    item_copy['exclude_hosts'] = exclude_hosts
+                                                    server_queues[other_server].put(item_copy)
+                                        else:
+                                            # 모든 서버에서 시도했지만 못 찾음 - 완료로 표시
+                                            torrent_status[torrent_id]['found'] = False
+                                            with completed_lock:
+                                                completed_torrents.add(torrent_id)
+                                    
+                                    used_queue.task_done()
+                            finally:
+                                work_session.close()
+                        except Exception as e:
+                            # 오류 발생 시 다른 큐로 넘기기
+                            with status_lock:
+                                if torrent_id not in torrent_status:
+                                    torrent_status[torrent_id] = {'found': False, 'tried_servers': {server_name}}
+                                else:
+                                    torrent_status[torrent_id]['tried_servers'].add(server_name)
+                                
+                                tried_servers = torrent_status[torrent_id].get('tried_servers', set())
+                                all_servers = {'missav', 'javlibrary', 'javdb', 'javmost', 'fc2ppv'}
+                                remaining_servers = all_servers - tried_servers
+                                
+                                if remaining_servers:
+                                    for other_server in remaining_servers:
+                                        if other_server in server_queues:
+                                            try:
+                                                item_copy = item.copy()
+                                                item_copy['exclude_hosts'] = exclude_hosts
+                                                server_queues[other_server].put(item_copy)
+                                            except:
+                                                pass
+                            
+                            if used_queue and hasattr(used_queue, 'task_done'):
+                                used_queue.task_done()
+                
+                # 서버별 스레드 시작 (각 서버당 1개씩만, 병렬 처리)
+                # 각 스레드는 공통 큐와 자신의 재시도 큐를 확인
+                worker_threads = []
+                
+                # MissAV 스레드
+                thread = threading.Thread(
+                    target=server_worker,
+                    args=(priority_queue, 'missav', [main_queue, server_queues['missav']], 
+                            [server_queues['javlibrary'], server_queues['javdb'], server_queues['javmost'], server_queues['fc2ppv']]),
+                    daemon=True
+                )
+                thread.start()
+                worker_threads.append(thread)
+                
+                # JAVLibrary 스레드
+                thread = threading.Thread(
+                    target=server_worker,
+                    args=(priority_queue, 'javlibrary', [main_queue, server_queues['javlibrary']],
+                            [server_queues['missav'], server_queues['javdb'], server_queues['javmost'], server_queues['fc2ppv']]),
+                    daemon=True
+                )
+                thread.start()
+                worker_threads.append(thread)
+                
+                # JAVDB 스레드
+                thread = threading.Thread(
+                    target=server_worker,
+                    args=(priority_queue, 'javdb', [main_queue, server_queues['javdb']],
+                            [server_queues['missav'], server_queues['javlibrary'], server_queues['javmost'], server_queues['fc2ppv']]),
+                    daemon=True
+                )
+                thread.start()
+                worker_threads.append(thread)
+                
+                # JAVMOST 스레드
+                thread = threading.Thread(
+                    target=server_worker,
+                    args=(priority_queue, 'javmost', [main_queue, server_queues['javmost']],
+                          [server_queues['missav'], server_queues['javlibrary'], server_queues['javdb'], server_queues['fc2ppv']]),
+                    daemon=True
+                )
+                thread.start()
+                worker_threads.append(thread)
+                
+                # FC2PPV 스레드
+                thread = threading.Thread(
+                    target=server_worker,
+                    args=(priority_queue, 'fc2ppv', [main_queue],
+                          [server_queues['missav'], server_queues['javlibrary'], server_queues['javdb'], server_queues['javmost']]),
+                    daemon=True
+                )
+                thread.start()
+                worker_threads.append(thread)
+                
+                # 모든 작업 완료 대기 및 진행 상황 업데이트
+                completed_count = 0
+                all_queues = [priority_queue, main_queue] + list(server_queues.values())
+                
+                while any(not q.empty() for q in all_queues) or any(t.is_alive() for t in worker_threads):
+                    if self._stop_requested:
+                        break
+                    
+                    # 진행 상황 업데이트 (완료된 토렌트 수로 계산)
+                    with completed_lock:
+                        current_completed = len(completed_torrents)
+                    
+                    if current_completed != completed_count:
+                        completed_count = current_completed
+                        print(f"\r[썸네일] 검색 중... {completed_count}/{total} (업데이트: {updated_count})", end='', flush=True)
+                        self.progress.emit(
+                            int((completed_count / total) * 100) if total > 0 else 0,
+                            f"썸네일 검색 중... {completed_count}/{total} (업데이트: {updated_count})"
+                        )
+                    
+                    import time
+                    time.sleep(0.5)  # 진행 상황 확인 간격
+                
+                # 모든 작업 완료 대기
+                priority_queue.join()
+                main_queue.join()
+                for q in server_queues.values():
+                    q.join()
+                
                 print(f"\n[썸네일] 백그라운드 업데이트 완료: {updated_count}개")
-                
-                # 모든 변경사항 커밋
-                try:
-                    session.commit()
-                except Exception as e:
-                    print(f"[썸네일] 커밋 오류: {e}")
-                    session.rollback()
-                
                 self.finished.emit(updated_count)
             
             finally:
-                session.close()
+                if 'session' in locals():
+                    try:
+                        session.close()
+                    except:
+                        pass
         
         except Exception as e:
             print(f"[썸네일] 백그라운드 업데이트 오류: {e}")
@@ -1013,7 +1636,15 @@ class MainWindow(QMainWindow):
         # 이미 실행 중이면 우선순위만 업데이트
         if self.thumbnail_thread and self.thumbnail_thread.isRunning():
             if priority_ids:
-                print(f"[썸네일] 페이지 변경 - 우선순위 업데이트: {len(priority_ids)}개 (ID: {priority_ids})")
+                # 제목 추출하여 표시
+                titles = []
+                for t in torrents:
+                    if t.id in priority_ids:
+                        titles.append(t.title[:40] if t.title else f"ID:{t.id}")
+                titles_str = ", ".join(titles[:5])  # 처음 5개만 표시
+                if len(titles) > 5:
+                    titles_str += f" 외 {len(titles) - 5}개"
+                print(f"[썸네일] 페이지 변경 - 우선순위 업데이트: {len(priority_ids)}개 ({titles_str})")
                 self.thumbnail_thread.update_priority_ids(priority_ids)
             else:
                 print(f"[썸네일] 페이지 변경 - 현재 페이지에 썸네일 없는 항목 없음")
@@ -1021,7 +1652,15 @@ class MainWindow(QMainWindow):
         
         # 새로 시작
         if priority_ids:
-            print(f"[썸네일] 백그라운드 업데이트 시작 (우선: {len(priority_ids)}개, ID: {priority_ids})")
+            # 제목 추출하여 표시
+            titles = []
+            for t in torrents:
+                if t.id in priority_ids:
+                    titles.append(t.title[:40] if t.title else f"ID:{t.id}")
+            titles_str = ", ".join(titles[:5])  # 처음 5개만 표시
+            if len(titles) > 5:
+                titles_str += f" 외 {len(titles) - 5}개"
+            print(f"[썸네일] 백그라운드 업데이트 시작 (우선: {len(priority_ids)}개, {titles_str})")
         else:
             print(f"[썸네일] 백그라운드 업데이트 시작 (우선 항목 없음)")
         self.thumbnail_thread = ThumbnailUpdateThread(self.db, priority_ids)
@@ -1058,10 +1697,16 @@ class MainWindow(QMainWindow):
         self.torrent_list.update_thumbnail_by_id(torrent_id, thumbnail_url)
 
     def on_replace_thumbnail_requested(self, torrent_id: int):
-        """교체 버튼 클릭 처리: 큐에 추가하여 순차 처리"""
+        """교체 버튼 클릭 처리: 최우선으로 처리"""
         try:
-            # 큐에 추가
-            self.replace_queue.put(torrent_id)
+            # 백그라운드 썸네일 업데이트가 실행 중이면 우선순위 큐에 최우선으로 추가
+            if self.thumbnail_thread and self.thumbnail_thread.isRunning():
+                # 우선순위 큐에 최우선으로 추가
+                self.thumbnail_thread.update_priority_ids([torrent_id], force_first=True)
+                self.status_bar.showMessage(f"썸네일 교체 최우선 처리 중... (ID: {torrent_id})", 0)
+            else:
+                # 백그라운드 업데이트가 없으면 기존 방식으로 처리
+                self.replace_queue.put(torrent_id)
             queue_size = self.replace_queue.qsize()
             
             if queue_size == 1:
