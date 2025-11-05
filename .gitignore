@@ -47,7 +47,5 @@ venv.bak/
 Thumbs.db
 
 # Project specific
-torrents.db
 *.log
-torrents.db-journal
 torrents.db-journal

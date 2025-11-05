@@ -1,48 +1,3 @@
-[ImageFinder] MissAV 성공!
-[ThumbnailEnhancer] OK 썸네일 발견! https://icdn.missav123.to/img2/s360/6f/royd-236/cover.webp
-Traceback (most recent call last):
-  File "c:\Users\duals\OneDrive\duals\sw_personal\251104_torrent_collector\gui\main_window.py", line 976, in start_thumbnail_update
-[썸네일] 검색 중... 796/11434 (업데이트: 720)    self.thumbnail_thread.update_priority_ids(priority_ids)
-  File "c:\Users\duals\OneDrive\duals\sw_personal\251104_torrent_collector\gui\main_window.py", line 54, in update_priority_ids
-    existing_ids = {t.id for t in self._torrents_to_process}
-  File "c:\Users\duals\OneDrive\duals\sw_personal\251104_torrent_collector\gui\main_window.py", line 54, in <setcomp>
-    existing_ids = {t.id for t in self._torrents_to_process}
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\attributes.py", line 566, in __get__
-    return self.impl.get(state, dict_)  # type: ignore[no-any-return]
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\attributes.py", line 1086, in get
-    value = self._fire_loader_callables(state, key, passive)
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\attributes.py", line 1116, in _fire_loader_callables
-    return state._load_expired(state, passive)
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\state.py", line 803, in _load_expired
-    self.manager.expired_attribute_loader(self, toload, passive)
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\loading.py", line 1670, in load_scalar_attributes
-    result = load_on_ident(
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\loading.py", line 509, in load_on_ident
-    return load_on_pk_identity(
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\loading.py", line 694, in load_on_pk_identity
-    session.execute(
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\session.py", line 2365, in execute
-    return self._execute_internal(
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\session.py", line 2241, in _execute_internal
-[ThumbnailEnhancer] 이미지 검색 중: [中文字幕] ROYD-235 大幅提升成績的爆乳方法！極上的獎勵胸部讓睪丸和腰...
-[ImageFinder] 작품번호 추출: ROYD-235 (제목: [中文字幕] ROYD-235 大幅提升成績的爆乳方法！極上的獎勵胸部讓睪丸和腰部擺動的爆乳家庭教師...)
-[ImageFinder] 1단계: 작품번호로 검색 (ROYD-235)
-    conn = self._connection_for_bind(bind)
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\session.py", line 2110, in _connection_for_bind
-    return trans._connection_for_bind(engine, execution_options)
-  File "<string>", line 2, in _connection_for_bind
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\state_changes.py", line 103, in _go
-    self._raise_for_prerequisite_state(fn.__name__, current_state)
-  File "C:\Users\duals\AppData\Local\Programs\Python\Python310\lib\site-packages\sqlalchemy\orm\session.py", line 996, in _raise_for_prerequisite_state
-    raise sa_exc.InvalidRequestError(
-sqlalchemy.exc.InvalidRequestError: This session is in 'prepared' state; no further SQL can be emitted within this transaction.
-[Sukebei (Seeders)] DB 저장 중... 3187/3693 (신규: 1074, 업데이트: 2104)[UI] 썸네일 즉시 업데이트: 행 29
-[Sukebei (Seeders)] DB 저장 중... 3189/3693 (신규: 1076, 업데이트: 2104)[ImageFinder] 작품번호 추출: FC2-PPV-4789564 (제목: [HD/720p]  FC2PPV 4789564 【11/14まで50%OFF!】Fカップ美乳のスレ...)
-
-1. 위처럼 에러나는 경우 있음
-
-2. 크기로 정렬할때 단위가 고려되지 않음 M G 등
-
 3. 썸네일 호버링확대창이 앱을 벗어남!!
   - 호버링 옵션이 항상 우측하단인가? 옵션이 있다면 이걸 조정하면 좋겠는데.
 
@@ -61,5 +16,22 @@ sqlalchemy.exc.InvalidRequestError: This session is in 'prepared' state; no furt
   - FC2 PPV 4789564 이런것도 포함
   - FC2PPV 4789564 이런것도 포함
   - 찾아지면 앨범에 스냅샷도 있다.
+  - 여기서는 fc2 관련 제목들만 여기서 검색하도록
 
 8. 썸네일 다운로드 순서는 GUI에 정렬된 순서대로
+
+9. 아래와 같은경우 이미지 없음으로 변경하고 다시 썸네일 검색하도록
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/cb/start-306/c...
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/c9/mond-290/co...
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/f6/waaa-121/co...
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/59/mifd-603/co...
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/13/vod-047/cov...
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/86/mifd-570/co...
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/f4/midv-852/co...
+[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: https://icdn.missav123.to/img2/s360/a3/fc2-ppv-477...
+
+10. MD 파일들 업데이트하기, 설명은 영어 및 한국어로 양방향으로
+
+11. 언어 설정가능하도록 변경, 영어 및 한국어 지원
+
+12. 썸네일 서버별로 쓰레드를 각기 돌려서 검색할까? 그래서 썸네일 없는거를 빠르게 채우는걸 위주로

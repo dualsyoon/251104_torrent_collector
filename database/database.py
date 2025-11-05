@@ -234,7 +234,11 @@ class Database:
             query = query.filter(Torrent.title.contains(search_query))
         
         # 정렬 (파라미터에 따라)
-        sort_column = getattr(Torrent, sort_by, Torrent.upload_date)
+        # size 필드 정렬 시 size_bytes를 사용 (단위 고려)
+        if sort_by == 'size':
+            sort_column = Torrent.size_bytes
+        else:
+            sort_column = getattr(Torrent, sort_by, Torrent.upload_date)
 
         if sort_order == 'desc':
             query = query.order_by(desc(sort_column))

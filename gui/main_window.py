@@ -23,10 +23,10 @@ class ThumbnailUpdateThread(QThread):
     error = Signal(str)
     thumbnail_updated = Signal(int, str)  # (torrent_id, thumbnail_url) - 개별 업데이트
     
-    def __init__(self, db: Database, db_writer: DBWriterThread, priority_ids: list = None):
+    def __init__(self, db: Database, priority_ids: list = None, db_writer: DBWriterThread = None):
         super().__init__()
         self.db = db
-        self.db_writer = db_writer
+        self.db_writer = db_writer  # 현재 사용되지 않지만 호환성을 위해 유지
         self.priority_ids = priority_ids or []  # 현재 페이지 항목 ID 우선 (순서 유지를 위해 list 사용)
         self._stop_requested = False
         self._priority_lock = None  # 스레드 락 (run에서 초기화)
@@ -51,8 +51,18 @@ class ThumbnailUpdateThread(QThread):
                 return
             
             # 이미 처리 중인 항목에서 새로운 우선순위 항목이 있는지 확인
-            existing_ids = {t.id for t in self._torrents_to_process}
-            existing_priority = [t for t in self._torrents_to_process if t.id in self.priority_ids]
+            # SQLAlchemy 세션 상태 문제 방지를 위해 안전하게 ID 추출
+            existing_ids = set()
+            existing_priority = []
+            for t in self._torrents_to_process:
+                try:
+                    torrent_id = t.id
+                    existing_ids.add(torrent_id)
+                    if torrent_id in self.priority_ids:
+                        existing_priority.append(t)
+                except Exception:
+                    # 세션이 준비된 상태이거나 다른 문제로 접근 불가능한 경우 건너뛰기
+                    continue
             
             # DB에서 아직 큐에 없는 새 항목들만 가져오기
             new_ids = [id for id in self.priority_ids if id not in existing_ids]
@@ -85,16 +95,28 @@ class ThumbnailUpdateThread(QThread):
                         other_items = []
                         
                         for item in remaining:
-                            if item.id in self.priority_ids:
-                                priority_items.append(item)
-                            else:
+                            try:
+                                item_id = item.id
+                                if item_id in self.priority_ids:
+                                    priority_items.append(item)
+                                else:
+                                    other_items.append(item)
+                            except Exception:
+                                # 세션 상태 문제로 접근 불가능한 경우 일반 항목으로 처리
                                 other_items.append(item)
                         
                         # 우선순위 순서대로 정렬 (self.priority_ids는 이미 순서가 있는 list)
-                        priority_items_sorted = sorted(
-                            priority_items,
-                            key=lambda t: self.priority_ids.index(t.id) if t.id in self.priority_ids else 999999
-                        )
+                        def safe_sort_key(t):
+                            try:
+                                torrent_id = t.id
+                                if torrent_id in self.priority_ids:
+                                    return self.priority_ids.index(torrent_id)
+                                else:
+                                    return 999999
+                            except Exception:
+                                return 999999
+                        
+                        priority_items_sorted = sorted(priority_items, key=safe_sort_key)
                         
                         # 우선순위 항목을 앞으로
                         self._torrents_to_process[self._current_index:] = priority_items_sorted + other_items
@@ -114,16 +136,28 @@ class ThumbnailUpdateThread(QThread):
                     other_items = []
                     
                     for item in remaining:
-                        if item.id in self.priority_ids:
-                            priority_items.append(item)
-                        else:
+                        try:
+                            item_id = item.id
+                            if item_id in self.priority_ids:
+                                priority_items.append(item)
+                            else:
+                                other_items.append(item)
+                        except Exception:
+                            # 세션 상태 문제로 접근 불가능한 경우 일반 항목으로 처리
                             other_items.append(item)
                     
                     # 우선순위 순서대로 정렬 (self.priority_ids는 이미 순서가 있는 list)
-                    priority_items_sorted = sorted(
-                        priority_items,
-                        key=lambda t: self.priority_ids.index(t.id) if t.id in self.priority_ids else 999999
-                    )
+                    def safe_sort_key(t):
+                        try:
+                            torrent_id = t.id
+                            if torrent_id in self.priority_ids:
+                                return self.priority_ids.index(torrent_id)
+                            else:
+                                return 999999
+                        except Exception:
+                            return 999999
+                    
+                    priority_items_sorted = sorted(priority_items, key=safe_sort_key)
                     
                     self._torrents_to_process[self._current_index:] = priority_items_sorted + other_items
     
@@ -159,10 +193,17 @@ class ThumbnailUpdateThread(QThread):
                     ).all()
                     
                     # priority_ids 순서대로 정렬 (페이지 표시 순서 유지, self.priority_ids는 이미 list)
-                    priority_torrents_sorted = sorted(
-                        priority_torrents,
-                        key=lambda t: self.priority_ids.index(t.id) if t.id in self.priority_ids else 999999
-                    )
+                    def safe_sort_key(t):
+                        try:
+                            torrent_id = t.id
+                            if torrent_id in self.priority_ids:
+                                return self.priority_ids.index(torrent_id)
+                            else:
+                                return 999999
+                        except Exception:
+                            return 999999
+                    
+                    priority_torrents_sorted = sorted(priority_torrents, key=safe_sort_key)
                     
                     self._torrents_to_process.extend(priority_torrents_sorted)
                     if priority_torrents_sorted:
