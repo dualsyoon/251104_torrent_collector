@@ -8,7 +8,7 @@ import random
 import json
 import os
 import pathlib
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlencode
 from requests.exceptions import RequestException, ConnectionError, Timeout
 from config import ENABLE_JAVDB_FALLBACK, ENABLE_SELENIUM_FOR_IMAGES, IMAGE_HTTP_TIMEOUT, IMAGE_HTTP_RETRIES, PROXY_URL
 from PySide6.QtCore import QSettings
@@ -39,7 +39,9 @@ class ImageFinder:
         # JAVDB 연결 실패 시 자동 비활성화 플래그
         qs = QSettings()
         self.enable_javdb = qs.value('images/enable_javdb_fallback', ENABLE_JAVDB_FALLBACK, type=bool)
-        self.javdb_available = self.enable_javdb
+        # 프로그램 시작 시 항상 활성화 상태로 리셋 (이전 실행의 차단 상태 무시)
+        # enable_javdb가 True이면 항상 활성화 상태로 시작
+        self.javdb_available = True if self.enable_javdb else False
         self.javdb_fail_count = 0
         
         # JAVLibrary HTTP 차단 감지 플래그
@@ -913,72 +915,234 @@ class ImageFinder:
             return []
     
     def _search_javdb(self, code: str) -> List[str]:
-        """JAVDB.com에서 이미지 검색"""
+        """JAVDB.com에서 이미지 검색 (test_javdb_cover_search.py 기반)"""
         if not self.javdb_available:
+            print(f"[ImageFinder] JAVDB 비활성화됨 (코드: {code})")
             return []
+        print(f"[ImageFinder] JAVDB 검색 시작: {code}")
         try:
-            # JAVDB 검색 URL
-            search_url = f"https://javdb.com/search?q={quote(code)}"
+            # JAVDB 미러 도메인 목록
+            javdb_bases = [
+                "https://javdb.com",
+                "https://javdb5.com",
+                "https://javdb7.com",
+                "https://javdb9.com",
+            ]
             
-            headers = {
+            # cloudscraper 사용 가능 여부 확인
+            use_cloudscraper = False
+            try:
+                import cloudscraper
+                use_cloudscraper = True
+            except ImportError:
+                pass
+            
+            # HTTP 클라이언트 생성
+            if use_cloudscraper:
+                try:
+                    import cloudscraper
+                    session = cloudscraper.create_scraper(
+                        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                    )
+                except Exception:
+                    session = self.session
+            else:
+                session = self.session
+            
+            # 세션 헤더 설정
+            session.headers.update({
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://javdb.com/'
-            }
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9,ko;q=0.8',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'DNT': '1',
+            })
             
-            response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
-            if response.status_code != 200:
-                # HTTP 에러면 셀레니움 우회 시도
-                if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
-                    return self._search_javdb_selenium(code)
+            # 쿠키 설정
+            for dom in [".javdb.com", ".javdb5.com", ".javdb7.com", ".javdb9.com"]:
+                try:
+                    session.cookies.set("over18", "1", domain=dom)
+                except Exception:
+                    pass
+            
+            # 미러 도메인 시도
+            html = None
+            base_url = None
+            search_url = None
+            
+            for base in javdb_bases:
+                try:
+                    url = f"{base}/search?{urlencode({'q': code, 'f': 'all'})}"
+                    # 홈 워밍업
+                    session.get(base + "/", headers={"Referer": base + "/"}, timeout=20)
+                    # 검색 요청
+                    r = session.get(url, headers={"Referer": base + "/"}, timeout=25, allow_redirects=True)
+                    # 403이면 재시도
+                    if r.status_code == 403:
+                        time.sleep(1.2)
+                        session.get(base + "/", headers={"Referer": base + "/"}, timeout=20)
+                        r = session.get(url, headers={"Referer": base + "/"}, timeout=25, allow_redirects=True)
+                    
+                    if r.status_code == 200 and len(r.text) > 1000:
+                        html = r.text
+                        base_url = base
+                        search_url = url
+                        # 연결 성공 시 활성화 상태 복구
+                        if not self.javdb_available:
+                            self.javdb_available = True
+                            self.javdb_fail_count = 0
+                            print(f"[ImageFinder] JAVDB 재활성화: 연결 성공으로 인해 활성화 상태로 복구")
+                        print(f"[ImageFinder] JAVDB 연결 성공: {base} (코드: {code})")
+                        break
+                    else:
+                        print(f"[ImageFinder] JAVDB 응답 실패: {base}, status={r.status_code}, len={len(r.text)}")
+                except Exception as e:
+                    print(f"[ImageFinder] JAVDB 요청 오류 ({base}): {e}")
+                    continue
+            
+            if not html:
+                # 모든 미러 실패 시 실패 카운트 증가
+                self.javdb_fail_count += 1
+                if self.javdb_fail_count >= 3 and self.javdb_available:
+                    self.javdb_available = False
+                    print("[ImageFinder] JAVDB 연결 불가 감지: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
                 return []
             
-            soup = BeautifulSoup(response.content, 'lxml')
+            soup = BeautifulSoup(html, 'lxml')
             image_urls = []
             
-            # 작품 카드에서 이미지 찾기 (여러 클래스명 시도)
-            video_cards = soup.find_all('div', class_='item')
-            if not video_cards:
-                video_cards = soup.find_all('div', class_='movie-item')
-            if not video_cards:
-                video_cards = soup.find_all('a', class_='box')
+            # 첫 번째 결과 카드 찾기 (test_javdb_cover_search.py 로직)
+            def find_first_card_and_title(soup):
+                """첫 번째 결과 카드와 제목 텍스트 반환"""
+                anchors = soup.select('a[href^="/v/"]')
+                for a in anchors:
+                    has_visual = bool(a.select_one("img, .cover, .video-cover, .image"))
+                    if not has_visual:
+                        continue
+                    title_node = a.select_one(".title, strong, h3, h2")
+                    title_txt = (title_node.get_text(" ", strip=True) if title_node else a.get_text(" ", strip=True)) or ""
+                    if len(title_txt) >= 4:
+                        return a, title_txt
+                return None, None
             
-            if video_cards:
-                # 첫 번째 결과의 이미지
-                first_card = video_cards[0]
-                img = first_card.find('img')
-                if img:
-                    img_src = img.get('src', '') or img.get('data-src', '') or img.get('data-original', '')
-                    if img_src:
-                        # 상대 URL 처리
-                        if not img_src.startswith('http'):
-                            if img_src.startswith('//'):
-                                img_src = 'https:' + img_src
-                            elif img_src.startswith('/'):
-                                img_src = 'https://javdb.com' + img_src
-                            else:
-                                img_src = urljoin('https://javdb.com', img_src)
-                        if img_src.startswith('http'):
-                            image_urls.append(img_src)
-                            print(f"[ImageFinder] JAVDB에서 이미지 발견: {code}")
-            # 요청 성공이므로 실패 카운터 리셋
+            anchor, title_text = find_first_card_and_title(soup)
+            if not anchor:
+                print(f"[ImageFinder] JAVDB 카드 없음 (코드: {code}, HTML 길이: {len(html)})")
+                # 디버그: HTML 일부 출력
+                if len(html) > 0:
+                    soup_debug = BeautifulSoup(html, 'lxml')
+                    anchors_debug = soup_debug.select('a[href^="/v/"]')
+                    print(f"[ImageFinder] JAVDB 디버그: a[href^='/v/'] 앵커 {len(anchors_debug)}개 발견")
+                    if len(anchors_debug) > 0:
+                        first_anchor = anchors_debug[0]
+                        has_visual = bool(first_anchor.select_one("img, .cover, .video-cover, .image"))
+                        print(f"[ImageFinder] JAVDB 디버그: 첫 번째 앵커에 이미지 요소 있음: {has_visual}")
+                return []
+            
+            print(f"[ImageFinder] JAVDB 카드 발견 (코드: {code}, 카드제목: {title_text[:100] if title_text else 'None'}...)")
+            
+            # 제목 매칭 검증 (키워드 엄격 매칭)
+            def compile_keyword_strict(keyword):
+                """문자+숫자 정확 일치, 문자/숫자 사이 '-' 옵션"""
+                m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", keyword.strip())
+                if not m:
+                    k = keyword.strip()
+                    k = re.escape(k).replace(r"\-", "-?")
+                    return re.compile(rf"(?<![A-Za-z0-9]){k}(?![A-Za-z0-9])", re.I)
+                prefix, num = m.groups()
+                return re.compile(rf"(?<![A-Za-z0-9]){re.escape(prefix)}-?{re.escape(num)}(?![A-Za-z0-9])", re.I)
+            
+            kw_re = compile_keyword_strict(code)
+            match_result = kw_re.search(title_text) if title_text else None
+            if not title_text or not match_result:
+                print(f"[ImageFinder] JAVDB 제목 불일치 (코드: {code}, 카드제목: {title_text[:100] if title_text else 'None'})")
+                if title_text:
+                    print(f"[ImageFinder] JAVDB 매칭 패턴: {kw_re.pattern}")
+                return []  # 제목 불일치
+            
+            print(f"[ImageFinder] JAVDB 제목 매칭 성공 (코드: {code})")
+            
+            # 카드 이미지 수집
+            def _extract_bg_url(style_str):
+                """스타일에서 background-image URL 추출"""
+                if not style_str:
+                    return None
+                m = re.search(r"url\((['\"]?)(.+?)\1\)", style_str)
+                return m.group(2) if m else None
+            
+            def collect_card_images(anchor, base_url):
+                """카드 내부의 커버 이미지 수집"""
+                cands = []
+                
+                def add(u, how):
+                    if not u:
+                        return
+                    if u.startswith("//"):
+                        u = "https:" + u
+                    cands.append({"url": urljoin(base_url, u), "how": how})
+                
+                # <img>
+                for img in anchor.select("img"):
+                    add(img.get("src"), "src")
+                    add(img.get("data-src"), "data-src")
+                    add(img.get("data-original"), "data-original")
+                    ss = img.get("srcset")
+                    if ss:
+                        parts = [p.strip() for p in ss.split(",") if p.strip()]
+                        for p in reversed(parts):  # 해상도 큰 것부터
+                            add(p.split()[0], "srcset")
+                
+                # background-image
+                for cov in anchor.select(".cover, .video-cover, .image"):
+                    bg = _extract_bg_url(cov.get("style", ""))
+                    add(bg, "bg-style")
+                
+                # 중복 제거
+                uniq, seen = [], set()
+                for c in cands:
+                    if c["url"] not in seen:
+                        uniq.append(c)
+                        seen.add(c["url"])
+                return uniq
+            
+            url_items = collect_card_images(anchor, base_url or "https://javdb.com")
+            print(f"[ImageFinder] JAVDB 이미지 후보 {len(url_items)}개 발견 (코드: {code})")
+            
+            # URL 추출 (첫 번째 이미지만 반환)
+            for item in url_items[:1]:  # 첫 번째 이미지만 사용
+                url = item["url"]
+                if url and url.startswith('http'):
+                    image_urls.append(url)
+                    print(f"[ImageFinder] JAVDB 이미지 URL 선택: {url[:80]}...")
+            
+            # 요청 성공이므로 실패 카운터 리셋 및 활성화 상태 복구
             if image_urls:
                 self.javdb_fail_count = 0
+                if not self.javdb_available:
+                    self.javdb_available = True
+                    print(f"[ImageFinder] JAVDB 재활성화: 이미지 발견으로 인해 활성화 상태로 복구")
+                print(f"[ImageFinder] JAVDB에서 이미지 발견: {code}")
                 return image_urls
-            # HTML 로딩은 됐지만 이미지 못 찾은 경우 셀레니움 시도
-            if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
-                return self._search_javdb_selenium(code)
-            return image_urls
+            
+            print(f"[ImageFinder] JAVDB 이미지 URL 없음 (코드: {code}, 후보 수: {len(url_items)})")
+            return []
             
         except (ConnectionError, Timeout) as e:
             # 연속 실패 카운트 및 자동 비활성화
             self.javdb_fail_count += 1
+            print(f"[ImageFinder] JAVDB 연결/타임아웃 오류 (코드: {code}): {e}")
             if self.javdb_fail_count >= 3 and self.javdb_available:
                 self.javdb_available = False
                 print("[ImageFinder] JAVDB 연결 불가 감지: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
             return []
-        except RequestException:
+        except RequestException as e:
+            print(f"[ImageFinder] JAVDB 요청 예외 (코드: {code}): {e}")
+            return []
+        except Exception as e:
+            import traceback
+            print(f"[ImageFinder] JAVDB 검색 오류 (코드: {code}): {e}")
+            print(f"[ImageFinder] JAVDB 검색 오류 상세: {traceback.format_exc()}")
             return []
 
     def _get_selenium_driver(self):
@@ -1823,11 +1987,121 @@ class ImageFinder:
             
             # 카드 제목 추출 & 키워드 엄격 매칭
             title_text = find_card_title_text(anchor)
-            kw_re = compile_keyword_strict(search_query)
-            title_ok = bool(title_text and kw_re.search(title_text))
+            
+            # 카드 제목에서 코드 추출 (전체 코드 추출, 앞의 숫자 접두사 포함)
+            def extract_code_from_title(card_title: str) -> str:
+                """카드 제목에서 코드 추출 (예: '326KNTR-003' -> '326KNTR-003', '259LUXU-1560' -> '259LUXU-1560', 'FC2-PPV-3600322' -> 'FC2-PPV-3600322', '4092-PPV361' -> '4092-PPV361')"""
+                if not card_title:
+                    return ""
+                # 패턴: [숫자]-[문자+숫자] 또는 [숫자][문자+숫자] 또는 FC2-PPV-숫자
+                # 예: '326KNTR-003' -> '326KNTR-003' (전체), '259LUXU-1560' -> '259LUXU-1560' (전체), '4092-PPV361' -> '4092-PPV361'
+                # FC2 코드 우선 확인 (반드시 FC2로 시작해야 함)
+                fc2_pattern = re.compile(r'\bFC2[-\s]?PPV[-\s]?\d+\b', re.I)
+                fc2_match = fc2_pattern.search(card_title)
+                if fc2_match:
+                    return fc2_match.group(0).replace(' ', '-').upper()
+                
+                # 일반 코드 패턴: [숫자]-[문자+숫자] 또는 [숫자][문자+숫자]
+                # 예: "4092-PPV361", "4092PPV361", "326KNTR-003"
+                code_pattern = re.compile(r'\d+-?[A-Za-z]+-?\d+', re.I)
+                matches = code_pattern.findall(card_title)
+                if matches:
+                    # 가장 긴 매치를 선택 (코드일 가능성이 높음)
+                    return max(matches, key=len)
+                
+                # 숫자 접두사 없는 코드도 시도
+                code_pattern2 = re.compile(r'[A-Za-z]+-?\d+', re.I)
+                matches2 = code_pattern2.findall(card_title)
+                if matches2:
+                    return max(matches2, key=len)
+                return ""
+            
+            # 검색 쿼리에서도 코드 추출
+            def extract_code_from_query(query: str) -> str:
+                """검색 쿼리에서 코드 추출"""
+                if not query:
+                    return ""
+                # FC2 코드 우선 확인 (반드시 FC2로 시작해야 함)
+                fc2_pattern = re.compile(r'\bFC2[-\s]?PPV[-\s]?\d+\b', re.I)
+                fc2_match = fc2_pattern.search(query)
+                if fc2_match:
+                    return fc2_match.group(0).replace(' ', '-').upper()
+                
+                # 일반 코드 패턴: [숫자]-[문자+숫자] 또는 [숫자][문자+숫자] 또는 [문자+숫자]
+                # 예: "4092-PPV361", "4092PPV361", "PPV361", "SSNI-123"
+                code_pattern = re.compile(r'\d+-?[A-Za-z]+-?\d+|[A-Za-z]+-?\d+', re.I)
+                matches = code_pattern.findall(query)
+                if matches:
+                    # 가장 긴 매치를 선택 (더 구체적인 코드일 가능성이 높음)
+                    return max(matches, key=len)
+                return query  # 코드 패턴이 없으면 원본 반환
+            
+            # 카드 제목에서 코드 추출
+            card_code = extract_code_from_title(title_text) if title_text else ""
+            # 검색 쿼리에서 코드 추출
+            search_code = extract_code_from_query(search_query)
+            
+            # 코드 매칭 (대소문자 무시, 하이픈 무시)
+            title_ok = False
+            if card_code and search_code:
+                # 정규화: 대문자로 변환, 하이픈과 공백 제거
+                card_code_norm = re.sub(r'[-\s]', '', card_code.upper())
+                search_code_norm = re.sub(r'[-\s]', '', search_code.upper())
+                
+                # 1) 완전 일치 확인
+                title_ok = card_code_norm == search_code_norm
+                
+                # 2) FC2 코드의 경우 부분 일치 확인 (PPV-360이 FC2-PPV-3600322에 포함되는지)
+                if not title_ok:
+                    # 검색 코드가 PPV-숫자 형태이고, 카드 코드가 FC2-PPV-숫자 형태인 경우
+                    if re.match(r'^PPV\d+$', search_code_norm) and re.match(r'^FC2PPV\d+$', card_code_norm):
+                        # PPV 뒤의 숫자가 카드 코드의 숫자 시작 부분과 일치하는지 확인
+                        search_num_match = re.search(r'PPV(\d+)', search_code_norm)
+                        card_num_match = re.search(r'FC2PPV(\d+)', card_code_norm)
+                        if search_num_match and card_num_match:
+                            search_num = search_num_match.group(1)
+                            card_num = card_num_match.group(1)
+                            # 검색 숫자가 카드 숫자의 시작 부분과 일치하는지 확인
+                            title_ok = card_num.startswith(search_num)
+                    
+                    # 검색 코드가 FC2-PPV-숫자 형태이고, 카드 코드도 FC2-PPV-숫자 형태인 경우
+                    elif re.match(r'^FC2PPV\d+$', search_code_norm) and re.match(r'^FC2PPV\d+$', card_code_norm):
+                        # 숫자 부분만 비교 (FC2-PPV-360과 FC2-PPV-3600322 매칭)
+                        search_num_match = re.search(r'FC2PPV(\d+)', search_code_norm)
+                        card_num_match = re.search(r'FC2PPV(\d+)', card_code_norm)
+                        if search_num_match and card_num_match:
+                            search_num = search_num_match.group(1)
+                            card_num = card_num_match.group(1)
+                            # 검색 숫자가 카드 숫자의 시작 부분과 일치하거나, 카드 숫자가 검색 숫자의 시작 부분과 일치하는지 확인
+                            title_ok = card_num.startswith(search_num) or search_num.startswith(card_num)
+                    
+                    # 숫자 접두사가 있는 코드 매칭 (326KNTR-003과 NTR-003 매칭)
+                    elif re.match(r'^\d+[A-Z]+\d+$', search_code_norm) and re.match(r'^\d+[A-Z]+\d+$', card_code_norm):
+                        # 숫자 접두사 제거 후 비교
+                        search_clean = re.sub(r'^\d+', '', search_code_norm)
+                        card_clean = re.sub(r'^\d+', '', card_code_norm)
+                        title_ok = search_clean == card_clean
+                    elif re.match(r'^\d+[A-Z]+\d+$', search_code_norm):
+                        # 검색 코드에 숫자 접두사가 있고, 카드 코드에도 숫자 접두사가 있는 경우
+                        search_clean = re.sub(r'^\d+', '', search_code_norm)
+                        if card_code_norm.endswith(search_clean) or search_clean in card_code_norm:
+                            title_ok = True
+                    elif re.match(r'^\d+[A-Z]+\d+$', card_code_norm):
+                        # 카드 코드에 숫자 접두사가 있고, 검색 코드에는 없는 경우
+                        card_clean = re.sub(r'^\d+', '', card_code_norm)
+                        if search_code_norm == card_clean:
+                            title_ok = True
+                    
+                    # 일반 코드의 경우 부분 일치 확인 (검색 코드가 카드 코드에 포함되는지)
+                    elif search_code_norm in card_code_norm or card_code_norm in search_code_norm:
+                        title_ok = True
+            elif title_text:
+                # 코드 추출 실패 시 기존 방식으로 폴백 (키워드 매칭)
+                kw_re = compile_keyword_strict(search_query)
+                title_ok = bool(kw_re.search(title_text))
             
             if not title_ok:
-                print(f"[ImageFinder] JAVBee 카드 제목 불일치 - 이미지 없음으로 처리 (제목: {display_title}, 카드제목: {title_text})")
+                print(f"[ImageFinder] JAVBee 카드 제목 불일치 - 이미지 없음으로 처리 (제목: {display_title}, 카드제목: {title_text}, 추출코드: {card_code}, 검색코드: {search_code})")
                 return []  # 제목이 키워드와 일치하지 않으면 즉시 반환
             
             print(f"[ImageFinder] JAVBee 카드 제목 매칭 성공 (제목: {display_title}, 카드제목: {title_text})")

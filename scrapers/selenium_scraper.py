@@ -92,7 +92,7 @@ class SeleniumBaseScraper:
             raise
     
     def get_page_selenium(self, url: str, wait_time: int = 5) -> Optional[BeautifulSoup]:
-        """Selenium으로 페이지 가져오기
+        """Cloudscraper 먼저 시도, 실패 시 Selenium으로 페이지 가져오기
         
         Args:
             url: 요청할 URL
@@ -101,6 +101,31 @@ class SeleniumBaseScraper:
         Returns:
             BeautifulSoup 객체 또는 None
         """
+        # 1단계: cloudscraper 먼저 시도
+        try:
+            import cloudscraper
+            print(f"[{self.name}] Cloudscraper로 시도 중: {url}")
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            scraper.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+            })
+            response = scraper.get(url, timeout=25)
+            if response.status_code == 200 and len(response.text) > 1000:
+                print(f"[{self.name}] OK Cloudscraper 성공 ({len(response.text)} bytes)")
+                return BeautifulSoup(response.text, 'lxml')
+            else:
+                print(f"[{self.name}] Cloudscraper 실패: status={response.status_code}, len={len(response.text)}")
+        except ImportError:
+            print(f"[{self.name}] Cloudscraper 미설치 - Selenium으로 진행")
+        except Exception as e:
+            print(f"[{self.name}] Cloudscraper 오류: {e} - Selenium으로 진행")
+        
+        # 2단계: Cloudscraper 실패 시 Selenium 사용
+        print(f"[{self.name}] Selenium으로 시도 중: {url}")
         # 재시도 로직 (네트워크 리셋 대비)
         last_exc = None
         for attempt in range(3):
@@ -119,7 +144,7 @@ class SeleniumBaseScraper:
                 except:
                     pass
                 page_source = self.driver.page_source
-                print(f"[{self.name}] OK 페이지 로드 완료 ({len(page_source)} bytes)")
+                print(f"[{self.name}] OK Selenium 페이지 로드 완료 ({len(page_source)} bytes)")
                 return BeautifulSoup(page_source, 'lxml')
             except Exception as e:
                 last_exc = e

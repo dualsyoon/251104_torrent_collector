@@ -12,7 +12,7 @@ from .torrent_list import TorrentListWidget
 from database import Database
 from database.db_writer import DBWriterThread
 from scrapers import ScraperManager
-from config import PAGE_SIZE, MAX_SCRAPE_PAGES, ENABLE_THUMBNAIL, MAX_CONSECUTIVE_DUPLICATES
+from config import PAGE_SIZE, MAX_SCRAPE_PAGES, ENABLE_THUMBNAIL, MAX_CONSECUTIVE_DUPLICATES, THUMBNAIL_SERVER_BLOCK_THRESHOLD
 from .settings_dialog import SettingsDialog
 
 
@@ -408,7 +408,7 @@ class ThumbnailUpdateThread(QThread):
                 server_queues = {
                     # 'missav': queue.Queue(),  # 비활성화
                     # 'javlibrary': queue.Queue(),  # 비활성화
-                    # 'javdb': queue.Queue(),  # 비활성화
+                    'javdb': queue.Queue(),  # JAVDB 서버 큐
                     'fc2ppv': queue.Queue(),  # FC2 재시도 큐
                     'javbee': queue.Queue()  # JAVBee 서버 큐
                 }
@@ -477,52 +477,31 @@ class ThumbnailUpdateThread(QThread):
                                     break
                     
                     # 1단계: 작품번호로 검색 (있는 경우, FC2가 아닌 경우)
-                    if not is_fc2_title and codes:
-                        # missav, javlibrary, javdb 비활성화
-                        # if server == 'missav':
-                        #     from config import ENABLE_SELENIUM_FOR_IMAGES
-                        #     if ENABLE_SELENIUM_FOR_IMAGES:
-                        #         for code in codes:
-                        #             urls = finder._search_missav_selenium(code)
-                        #             image_urls.extend(urls)
-                        #             if image_urls:
-                        #                 break
-                        # elif server == 'javlibrary':
-                        #     from config import ENABLE_SELENIUM_FOR_IMAGES
-                        #     if ENABLE_SELENIUM_FOR_IMAGES:
-                        #         # Selenium 우선 시도 (HTTP 403 우회)
-                        #         for code in codes:
-                        #             urls = finder._search_javlibrary_selenium(code)
-                        #             image_urls.extend(urls)
-                        #             if image_urls:
-                        #                 break
-                        #     # Selenium 실패 시 일반 HTTP 시도
-                        #     if not image_urls:
-                        #         for code in codes:
-                        #             urls = finder._search_javdatabase(code)
-                        #             image_urls.extend(urls)
-                        #             if image_urls:
-                        #                 break
-                        # elif server == 'javdb':
-                        #     from config import ENABLE_SELENIUM_FOR_IMAGES
-                        #     if ENABLE_SELENIUM_FOR_IMAGES:
-                        #         for code in codes:
-                        #             urls = finder._search_javdb_selenium(code)
-                        #             image_urls.extend(urls)
-                        #             if image_urls:
-                        #                 break
-                        #     else:
-                        #         for code in codes:
-                        #             urls = finder._search_javdb(code)
-                        #             image_urls.extend(urls)
-                        #             if image_urls:
-                        #                 break
-                        if server == 'javbee':
-                            for code in codes:
-                                urls = finder._search_javbee(code)
+                    if not is_fc2_title:
+                        if server == 'javdb':
+                            if codes:
+                                for code in codes:
+                                    print(f"[{server.upper()}] 코드로 검색 시도: {code} (제목: {title[:50]}...)")
+                                    urls = finder._search_javdb(code)
+                                    image_urls.extend(urls)
+                                    if image_urls:
+                                        break
+                            else:
+                                print(f"[{server.upper()}] 코드 없음 - 제목으로 검색 시도: {title[:50]}...")
+                                # 코드가 없으면 제목으로 검색
+                                urls = finder._search_javdb(title)
                                 image_urls.extend(urls)
-                                if image_urls:
-                                    break
+                        elif server == 'javbee':
+                            if codes:
+                                for code in codes:
+                                    urls = finder._search_javbee(code)
+                                    image_urls.extend(urls)
+                                    if image_urls:
+                                        break
+                            else:
+                                # 코드가 없으면 제목으로 검색
+                                urls = finder._search_javbee(title)
+                                image_urls.extend(urls)
                     
                     # FC2PPV.stream 검색 (백업용, FC2 공식 사이트에서 못 찾은 경우)
                     if is_fc2_title and fc2_codes and server == 'fc2ppv' and not image_urls:
@@ -622,7 +601,7 @@ class ThumbnailUpdateThread(QThread):
                     # 서버 차단 감지용 변수
                     consecutive_no_found = 0  # 연속으로 찾지 못한 횟수
                     server_blocked = False  # 서버가 차단되었는지 여부
-                    BLOCK_THRESHOLD = 20  # 20개 처리했는데 발견이 0개면 차단으로 판단
+                    BLOCK_THRESHOLD = THUMBNAIL_SERVER_BLOCK_THRESHOLD  # 처리했는데 발견이 0개면 차단으로 판단
                     
                     # FC2 패턴 (FC2-PPV-숫자, FC2-PPV, FC2PPV, FC2 PPV 모두 포함)
                     fc2_patterns = [
@@ -1086,9 +1065,9 @@ class ThumbnailUpdateThread(QThread):
                                             tried_servers = torrent_status[torrent_id].get('tried_servers', set())
                                             # FC2가 아닌 항목은 FC2PPV 서버 제외
                                             if is_fc2_title(title):
-                                                all_servers = {'fc2ppv', 'javbee'}  # missav, javlibrary, javdb 비활성화
+                                                all_servers = {'fc2ppv', 'javdb', 'javbee'}  # missav, javlibrary 비활성화
                                             else:
-                                                all_servers = {'javbee'}  # missav, javlibrary, javdb 비활성화
+                                                all_servers = {'javdb', 'javbee'}  # missav, javlibrary 비활성화
                                             remaining_servers = all_servers - tried_servers
                                             
                                             if remaining_servers:
@@ -1119,9 +1098,9 @@ class ThumbnailUpdateThread(QThread):
                                         # 아직 시도하지 않은 다른 서버 큐에 추가
                                         # FC2가 아닌 항목은 FC2PPV 서버 제외
                                         if is_fc2_title(title):
-                                            all_servers = {'fc2ppv', 'javbee'}  # missav, javlibrary, javdb 비활성화
+                                            all_servers = {'fc2ppv', 'javdb', 'javbee'}  # missav, javlibrary 비활성화
                                         else:
-                                            all_servers = {'javbee'}  # missav, javlibrary, javdb 비활성화
+                                            all_servers = {'javdb', 'javbee'}  # missav, javlibrary 비활성화
                                         remaining_servers = all_servers - tried_servers
                                         
                                         if remaining_servers:
@@ -1151,9 +1130,9 @@ class ThumbnailUpdateThread(QThread):
                                 tried_servers = torrent_status[torrent_id].get('tried_servers', set())
                                 # FC2가 아닌 항목은 FC2PPV 서버 제외
                                 if is_fc2_title(title):
-                                    all_servers = {'fc2ppv'}  # missav, javlibrary, javdb 비활성화
+                                    all_servers = {'fc2ppv', 'javdb', 'javbee'}  # missav, javlibrary 비활성화
                                 else:
-                                    all_servers = set()  # missav, javlibrary, javdb 비활성화
+                                    all_servers = {'javdb', 'javbee'}  # missav, javlibrary 비활성화
                                 remaining_servers = all_servers - tried_servers
                                 
                                 if remaining_servers:
@@ -1196,21 +1175,21 @@ class ThumbnailUpdateThread(QThread):
                 # thread.start()
                 # worker_threads.append(thread)
                 
-                # JAVDB 스레드 (비활성화)
-                # thread = threading.Thread(
-                #     target=server_worker,
-                #     args=(priority_queue, 'javdb', [main_queue, server_queues['javdb']],
-                #             [server_queues['missav'], server_queues['javlibrary'], server_queues['fc2ppv'], server_queues['javbee']]),
-                #     daemon=True
-                # )
-                # thread.start()
-                # worker_threads.append(thread)
+                # JAVDB 스레드
+                thread = threading.Thread(
+                    target=server_worker,
+                    args=(priority_queue, 'javdb', [main_queue, server_queues['javdb']],
+                          [server_queues['fc2ppv'], server_queues['javbee']]),  # missav, javlibrary 비활성화
+                    daemon=True
+                )
+                thread.start()
+                worker_threads.append(thread)
                 
                 # FC2PPV 스레드
                 thread = threading.Thread(
                     target=server_worker,
                     args=(priority_queue, 'fc2ppv', [main_queue, server_queues['fc2ppv']],
-                          [server_queues['javbee']]),  # missav, javlibrary, javdb 비활성화
+                          [server_queues['javdb'], server_queues['javbee']]),  # missav, javlibrary 비활성화
                     daemon=True
                 )
                 thread.start()
@@ -1220,7 +1199,7 @@ class ThumbnailUpdateThread(QThread):
                 thread = threading.Thread(
                     target=server_worker,
                     args=(priority_queue, 'javbee', [main_queue, server_queues['javbee']],
-                          [server_queues['fc2ppv']]),  # missav, javlibrary, javdb 비활성화
+                          [server_queues['javdb']]),  # missav, javlibrary 비활성화
                     daemon=True
                 )
                 thread.start()
@@ -1251,6 +1230,19 @@ class ThumbnailUpdateThread(QThread):
                                         else:
                                             found_rate = (found / processed * 100) if processed > 0 else 0
                                             print(f"  [{server_name.upper()}] 실행 중 - 처리 {processed}개, 발견 {found}개 (발견률: {found_rate:.1f}%)")
+                                    
+                                    # 대기열 정보 출력
+                                    try:
+                                        priority_q_size = priority_queue.qsize() if hasattr(priority_queue, 'qsize') else 0
+                                        main_q_size = main_queue.qsize() if hasattr(main_queue, 'qsize') else 0
+                                        print(f"  [대기열] 우선순위 큐: {priority_q_size}개, 메인 큐: {main_q_size}개")
+                                        
+                                        for server_name, server_queue in server_queues.items():
+                                            server_q_size = server_queue.qsize() if hasattr(server_queue, 'qsize') else 0
+                                            if server_q_size > 0:
+                                                print(f"  [대기열] {server_name.upper()} 큐: {server_q_size}개")
+                                    except Exception as e:
+                                        print(f"  [대기열] 큐 정보 확인 오류: {e}")
                                     
                                     # DB Writer 상태 출력
                                     if hasattr(self, 'db_writer') and self.db_writer:

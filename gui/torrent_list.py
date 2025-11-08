@@ -454,8 +454,7 @@ class TorrentListWidget(QWidget):
                 # 현재 호버 중인 행의 이미지가 로딩 완료되면 자동으로 미리보기 표시
                 if self.enable_hover_preview and row == self.current_hover_row:
                     self._show_preview(pixmap)
-        else:
-            print(f"[TorrentList] URL에 해당하는 행을 찾을 수 없습니다: {url[:50]}...")
+        # else: URL이 url_to_rows에 없는 경우는 페이지 변경이나 썸네일 업데이트로 인한 정상적인 상황일 수 있으므로 조용히 무시
     
     def _load_visible_images(self):
         """보이는 행의 이미지만 로딩 (lazy loading)"""
