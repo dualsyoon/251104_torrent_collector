@@ -47,6 +47,9 @@ class Database:
         if not db_exists:
             print("[DB] 테이블 생성 완료")
         
+        # 마이그레이션 실행 (기존 DB에 새 필드 추가)
+        self._migrate_database()
+        
         # 초기 데이터 추가 (장르, 국가)
         self._initialize_data()
         
@@ -56,6 +59,27 @@ class Database:
     def get_session(self) -> Session:
         """새로운 데이터베이스 세션 반환"""
         return self.SessionLocal()
+    
+    def _migrate_database(self):
+        """데이터베이스 마이그레이션 (기존 DB에 새 필드 추가)"""
+        from sqlalchemy import inspect, text
+        
+        try:
+            inspector = inspect(self.engine)
+            columns = [col['name'] for col in inspector.get_columns('torrents')]
+            
+            # thumbnail_searched_servers 필드 추가
+            if 'thumbnail_searched_servers' not in columns:
+                print("[DB] 마이그레이션: thumbnail_searched_servers 필드 추가 중...")
+                with self.engine.connect() as conn:
+                    conn.execute(text(
+                        "ALTER TABLE torrents ADD COLUMN thumbnail_searched_servers TEXT DEFAULT '[]'"
+                    ))
+                    conn.commit()
+                print("[DB] 마이그레이션 완료: thumbnail_searched_servers 필드 추가됨")
+        except Exception as e:
+            print(f"[DB] 마이그레이션 오류: {e}")
+            # 마이그레이션 실패해도 계속 진행
     
     def _initialize_data(self):
         """초기 장르 및 국가 데이터 추가"""

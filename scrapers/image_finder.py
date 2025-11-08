@@ -80,10 +80,13 @@ class ImageFinder:
             raise last_exc
         return None
     
-    def search_images(self, title: str, max_images: int = 5, exclude_hosts: List[str] = None) -> dict:
+    def search_images(self, title: str, max_images: int = 5, exclude_hosts: List[str] = None, exclude_servers: List[str] = None) -> dict:
         """제목으로 이미지 검색 (MissAV → JAVLibrary → JAVDB → FC2PPV.stream)
         exclude_hosts: 해당 호스트를 포함하는 URL은 제외 (교체 기능용)
+        exclude_servers: 탐색하지 않을 서버 목록 (예: ['javlibrary', 'javdb'])
         """
+        if exclude_servers is None:
+            exclude_servers = []
         codes = self._extract_codes(title)
         image_urls: List[str] = []
 
@@ -118,111 +121,131 @@ class ImageFinder:
         if codes:
             print(f"[ImageFinder] 1단계: 작품번호로 검색 ({', '.join(codes)})")
 
-            # 1) MissAV 최우선 시도 (Selenium 사용)
-            if ENABLE_SELENIUM_FOR_IMAGES:
+            # 1) MissAV 최우선 시도 (Selenium 사용) - missav는 현재 비활성화
+            # if 'missav' not in exclude_servers and ENABLE_SELENIUM_FOR_IMAGES:
+            #     for code in codes:
+            #         urls = self._search_missav_selenium(code)
+            #         image_urls.extend(urls)
+            #         if len(image_urls) >= max_images:
+            #             break
+            #     
+            #     # MissAV 결과가 있으면 바로 리턴
+            #     if image_urls:
+            #         image_urls = _filter_urls(image_urls)
+            #         if image_urls:
+            #             print(f"[ImageFinder] MissAV 성공!")
+            #             return {
+            #                 'thumbnail': image_urls[0],
+            #                 'snapshots': []
+            #             }
+
+            # 2) JAVLibrary 시도
+            if 'javlibrary' not in exclude_servers:
                 for code in codes:
-                    urls = self._search_missav_selenium(code)
-                    image_urls.extend(urls)
+                    urls = self._search_javdatabase(code)
+                    for u in urls:
+                        if u not in image_urls:
+                            image_urls.append(u)
+                            if len(image_urls) >= max_images:
+                                break
                     if len(image_urls) >= max_images:
                         break
-                
-                # MissAV 결과가 있으면 바로 리턴
+
+                # 결과가 있으면 바로 리턴 (빠른 응답)
                 if image_urls:
                     image_urls = _filter_urls(image_urls)
                     if image_urls:
-                        print(f"[ImageFinder] MissAV 성공!")
+                        print(f"[ImageFinder] JAVLibrary 성공!")
                         return {
                             'thumbnail': image_urls[0],
                             'snapshots': []
                         }
-
-            # 2) JAVLibrary 시도
-            for code in codes:
-                urls = self._search_javdatabase(code)
-                for u in urls:
-                    if u not in image_urls:
-                        image_urls.append(u)
-                        if len(image_urls) >= max_images:
-                            break
-                if len(image_urls) >= max_images:
-                    break
-
-            # 결과가 있으면 바로 리턴 (빠른 응답)
-            if image_urls:
-                image_urls = _filter_urls(image_urls)
-                if image_urls:
-                    print(f"[ImageFinder] JAVLibrary 성공!")
-                    return {
-                        'thumbnail': image_urls[0],
-                        'snapshots': []
-                    }
             
-            # 3) JAVDB 시도 (Selenium 활성화 시 Selenium만, 아니면 HTTP만)
-            for code in codes:
-                if ENABLE_SELENIUM_FOR_IMAGES:
-                    # Selenium만 사용 (HTTP는 대부분 차단됨)
-                    urls = self._search_javdb_selenium(code)
+            # 3) JAVDB 시도 (Selenium 활성화 시 Selenium만, 아니면 HTTP만) - javdb는 현재 비활성화
+            # if 'javdb' not in exclude_servers:
+            #     for code in codes:
+            #         if ENABLE_SELENIUM_FOR_IMAGES:
+            #             # Selenium만 사용 (HTTP는 대부분 차단됨)
+            #             urls = self._search_javdb_selenium(code)
+            #             image_urls.extend(urls)
+            #         else:
+            #             # HTTP만 사용
+            #             urls_http = self._search_javdb(code)
+            #             image_urls.extend(urls_http)
+            #         
+            #         if len(image_urls) >= max_images:
+            #             break
+            #     
+            #     # 4) 결과가 있으면 바로 리턴 (빠른 응답)
+            #     if image_urls:
+            #         image_urls = _filter_urls(image_urls)
+            #         if image_urls:
+            #             print(f"[ImageFinder] JAVDB 성공!")
+            #             return {
+            #                 'thumbnail': image_urls[0],
+            #                 'snapshots': []
+            #             }
+            
+            # 5) JAVBee 시도 (현재 활성화된 서버)
+            if 'javbee' not in exclude_servers:
+                for code in codes:
+                    urls = self._search_javbee(code, title=title)
                     image_urls.extend(urls)
-                else:
-                    # HTTP만 사용
-                    urls_http = self._search_javdb(code)
-                    image_urls.extend(urls_http)
+                    if len(image_urls) >= max_images:
+                        break
                 
-                if len(image_urls) >= max_images:
-                    break
-            
-            # 4) 결과가 있으면 바로 리턴 (빠른 응답)
-            if image_urls:
-                image_urls = _filter_urls(image_urls)
+                # 결과가 있으면 바로 리턴
                 if image_urls:
-                    print(f"[ImageFinder] JAVDB 성공!")
-                    return {
-                        'thumbnail': image_urls[0],
-                        'snapshots': []
-                    }
+                    image_urls = _filter_urls(image_urls)
+                    if image_urls:
+                        print(f"[ImageFinder] JAVBee 성공!")
+                        return {
+                            'thumbnail': image_urls[0],
+                            'snapshots': []
+                        }
             
-            # 5) 최후의 수단: FC2PPV.stream (FC2 코드가 있을 때만)
-            if fc2_codes:
+            # 6) 최후의 수단: FC2PPV.stream (FC2 코드가 있을 때만)
+            if 'fc2ppv' not in exclude_servers and fc2_codes:
                 for fc2_code in fc2_codes:
                     urls = self._search_fc2ppv_stream(fc2_code)
                     image_urls.extend(urls)
                     if len(image_urls) >= max_images:
                         break
-            
-            # 6) FC2PPV.stream 결과가 있으면 리턴
-            if image_urls:
-                image_urls = _filter_urls(image_urls)
+                
+                # FC2PPV.stream 결과가 있으면 리턴
                 if image_urls:
-                    # 성공 메시지는 제거 (출력이 너무 많음)
-                    return {
-                        'thumbnail': image_urls[0],
-                        'snapshots': []
-                    }
+                    image_urls = _filter_urls(image_urls)
+                    if image_urls:
+                        # 성공 메시지는 제거 (출력이 너무 많음)
+                        return {
+                            'thumbnail': image_urls[0],
+                            'snapshots': []
+                        }
         
         # 2단계: 작품번호로 실패 시 전체 제목으로 재시도
         print(f"[ImageFinder] 2단계: 전체 제목으로 재검색...")
         
-        # MissAV 먼저 시도 (Selenium 사용 시)
-        if ENABLE_SELENIUM_FOR_IMAGES:
-            urls = self._search_missav_selenium(title)
-            image_urls.extend(urls)
+        # MissAV 먼저 시도 (Selenium 사용 시) - missav는 현재 비활성화
+        # if 'missav' not in exclude_servers and ENABLE_SELENIUM_FOR_IMAGES:
+        #     urls = self._search_missav_selenium(title)
+        #     image_urls.extend(urls)
         
         # MissAV 실패 시 JAVLibrary 시도
-        if not image_urls:
+        if 'javlibrary' not in exclude_servers and not image_urls:
             urls = self._search_javdatabase(title)
             image_urls.extend(urls)
         
-        # JAVLibrary 실패 시 JAVDB 시도
-        if not image_urls:
-            if ENABLE_SELENIUM_FOR_IMAGES:
-                urls = self._search_javdb_selenium(title)
-                image_urls.extend(urls)
-            else:
-                urls_http = self._search_javdb(title)
-                image_urls.extend(urls_http)
+        # JAVLibrary 실패 시 JAVDB 시도 - javdb는 현재 비활성화
+        # if 'javdb' not in exclude_servers and not image_urls:
+        #     if ENABLE_SELENIUM_FOR_IMAGES:
+        #         urls = self._search_javdb_selenium(title)
+        #         image_urls.extend(urls)
+        #     else:
+        #         urls_http = self._search_javdb(title)
+        #         image_urls.extend(urls_http)
         
         # JAVDB 실패 시 JAVBee 시도
-        if not image_urls:
+        if 'javbee' not in exclude_servers and not image_urls:
             if codes:
                 for code in codes:
                     urls = self._search_javbee(code, title=title)
@@ -237,7 +260,7 @@ class ImageFinder:
                         break
         
         # JAVBee 실패 시 FC2PPV.stream 시도 (FC2 코드가 있을 때만)
-        if not image_urls and fc2_codes:
+        if 'fc2ppv' not in exclude_servers and not image_urls and fc2_codes:
             for fc2_code in fc2_codes:
                 urls = self._search_fc2ppv_stream(fc2_code)
                 image_urls.extend(urls)

@@ -34,6 +34,7 @@ class Torrent(Base):
     # 미디어 정보
     thumbnail_url = Column(String(500))
     snapshot_urls = Column(Text)  # JSON 배열로 저장 (여러 스냅샷)
+    thumbnail_searched_servers = Column(Text, default='[]')  # JSON 배열로 저장 (탐색한 서버 목록: ['fc2ppv', 'javbee'])
     
     # 분류 정보
     category = Column(String(100))

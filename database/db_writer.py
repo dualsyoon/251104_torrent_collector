@@ -51,11 +51,11 @@ class DBWriterThread(QThread):
         op = WriteOperation(WriteOperationType.ADD_TORRENT, torrent_data, callback_id)
         self.queue.put(op)
     
-    def update_thumbnail(self, torrent_id: int, thumbnail_url: str, callback_id: Optional[str] = None):
+    def update_thumbnail(self, torrent_id: int, thumbnail_url: str, server_name: Optional[str] = None, callback_id: Optional[str] = None):
         """썸네일 업데이트 요청"""
         op = WriteOperation(
             WriteOperationType.UPDATE_THUMBNAIL,
-            {'torrent_id': torrent_id, 'thumbnail_url': thumbnail_url},
+            {'torrent_id': torrent_id, 'thumbnail_url': thumbnail_url, 'server_name': server_name},
             callback_id
         )
         self.queue.put(op)
@@ -243,10 +243,12 @@ class DBWriterThread(QThread):
     
     def _update_thumbnail(self, session, data: Dict[str, Any]):
         """썸네일 업데이트 (내부 메서드)"""
+        import json
         from database.models import Torrent
         
         torrent_id = data.get('torrent_id')
         thumbnail_url = data.get('thumbnail_url', '')
+        server_name = data.get('server_name')
         
         # 타입 검증
         if not torrent_id:
@@ -274,6 +276,19 @@ class DBWriterThread(QThread):
                     thumbnail_url = str(thumbnail_url) if thumbnail_url else ''
                 
                 torrent.thumbnail_url = thumbnail_url
+                
+                # 탐색한 서버 목록에 추가 (서버 이름이 제공된 경우)
+                if server_name:
+                    searched_servers = []
+                    if torrent.thumbnail_searched_servers:
+                        try:
+                            searched_servers = json.loads(torrent.thumbnail_searched_servers)
+                        except (json.JSONDecodeError, TypeError):
+                            searched_servers = []
+                    
+                    if server_name not in searched_servers:
+                        searched_servers.append(server_name)
+                        torrent.thumbnail_searched_servers = json.dumps(searched_servers)
             # torrent가 없으면 조용히 무시
         except Exception as e:
             print(f"[DBWriter] ⚠️ 썸네일 업데이트 오류 (torrent_id={torrent_id}): {e}")

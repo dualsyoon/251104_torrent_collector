@@ -906,6 +906,7 @@ class ThumbnailUpdateThread(QThread):
                             # 독립적인 세션 생성
                             work_session = self.db.get_session()
                             try:
+                                import json
                                 from database.models import Torrent
                                 torrent = work_session.get(Torrent, torrent_id)
                                 if not torrent:
@@ -921,8 +922,32 @@ class ThumbnailUpdateThread(QThread):
                                     used_queue.task_done()
                                     continue
                                 
+                                # DB에서 이미 이 서버에서 탐색했는지 확인
+                                searched_servers = []
+                                if torrent.thumbnail_searched_servers:
+                                    try:
+                                        searched_servers = json.loads(torrent.thumbnail_searched_servers)
+                                    except (json.JSONDecodeError, TypeError):
+                                        searched_servers = []
+                                
+                                if server_name in searched_servers:
+                                    # 이미 이 서버에서 탐색했으면 스킵
+                                    used_queue.task_done()
+                                    continue
+                                
                                 # 현재 서버에서 검색
                                 thumbnail_url = search_server_specific(title, server_name, exclude_hosts)
+                                
+                                # 탐색한 서버 목록에 추가 (성공/실패 관계없이) - DB_writer를 통해 저장
+                                if server_name not in searched_servers:
+                                    searched_servers.append(server_name)
+                                    if self.db_writer:
+                                        # DB_writer를 통해 비동기 저장 (썸네일 URL은 그대로 유지)
+                                        self.db_writer.update_thumbnail(torrent_id, torrent.thumbnail_url or '', server_name=server_name)
+                                    else:
+                                        # DB_writer가 없으면 직접 저장
+                                        torrent.thumbnail_searched_servers = json.dumps(searched_servers)
+                                        work_session.commit()
                                 
                                 # 다시 한번 확인 (다른 서버에서 이미 찾았을 수 있음)
                                 with status_lock:
@@ -999,8 +1024,8 @@ class ThumbnailUpdateThread(QThread):
                                         
                                         # DB에 저장 (DB_writer 사용)
                                         if self.db_writer:
-                                            # DB_writer를 통해 비동기 저장
-                                            self.db_writer.update_thumbnail(torrent_id, thumbnail_url)
+                                            # DB_writer를 통해 비동기 저장 (서버 이름 포함)
+                                            self.db_writer.update_thumbnail(torrent_id, thumbnail_url, server_name=server_name)
                                             # 세션은 닫기만 (커밋은 DB_writer가 처리)
                                             # torrent 객체는 더 이상 사용하지 않으므로 세션 닫기
                                             
@@ -1327,12 +1352,29 @@ class SingleThumbnailReplaceThread(QThread):
                     except Exception:
                         pass
                 
+                # DB에서 이미 탐색한 서버 목록 확인
+                import json
+                searched_servers = []
+                if t.thumbnail_searched_servers:
+                    try:
+                        searched_servers = json.loads(t.thumbnail_searched_servers)
+                    except (json.JSONDecodeError, TypeError):
+                        searched_servers = []
+                
+                # 탐색하지 않은 서버만 검색 (교체 시 우선 탐색)
+                exclude_servers = searched_servers.copy()  # 이미 탐색한 서버는 제외
+                
                 # ImageFinder 재사용 (없으면 새로 생성)
                 if self.image_finder is None:
                     from scrapers.image_finder import ImageFinder
                     self.image_finder = ImageFinder()
                 
-                result = self.image_finder.search_images(title, max_images=5, exclude_hosts=exclude_hosts or None)
+                result = self.image_finder.search_images(
+                    title, 
+                    max_images=5, 
+                    exclude_hosts=exclude_hosts or None,
+                    exclude_servers=exclude_servers if exclude_servers else None
+                )
                 new_url = (result.get('thumbnail') or '').strip()
                 if new_url and new_url != current_url:
                     # DB 저장 (DB_writer 사용)
