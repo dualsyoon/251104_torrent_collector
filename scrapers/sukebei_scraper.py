@@ -12,13 +12,14 @@ class SukebeiScraper(BaseScraper):
     def __init__(self):
         super().__init__('https://sukebei.nyaa.si', 'Sukebei')
     
-    def scrape_page(self, page: int = 1, sort_by: str = 'id', order: str = 'desc') -> List[Dict]:
+    def scrape_page(self, page: int = 1, sort_by: str = 'id', order: str = 'desc', query: Optional[str] = None) -> List[Dict]:
         """페이지에서 토렌트 정보 스크래핑
         
         Args:
             page: 페이지 번호
             sort_by: 정렬 기준 (id, comments, size, seeders, leechers, downloads)
             order: 정렬 순서 (asc, desc)
+            query: 검색어 (예: 'gachi')
             
         Returns:
             토렌트 정보 딕셔너리 리스트
@@ -26,8 +27,15 @@ class SukebeiScraper(BaseScraper):
         params = {
             'p': page,
             's': sort_by,
-            'o': order
+            'o': order,
+            'f': 0,  # 필터: 0=no filter
+            'c': '0_0'  # 카테고리: 0_0=all
         }
+        
+        # 검색어가 있으면 추가
+        if query:
+            from urllib.parse import quote
+            params['q'] = quote(query)
         
         soup = self.get_page(self.base_url, params=params)
         if not soup:
@@ -41,12 +49,38 @@ class SukebeiScraper(BaseScraper):
             print("토렌트 테이블을 찾을 수 없습니다.")
             return []
         
-        rows = table.find('tbody').find_all('tr')
+        tbody = table.find('tbody')
+        if not tbody:
+            print("토렌트 테이블 tbody를 찾을 수 없습니다.")
+            return []
         
-        for row in rows:
+        rows = tbody.find_all('tr')
+        
+        # 첫 번째 행이 헤더인지 확인 (td가 없거나 적으면 헤더)
+        if rows and len(rows) > 0:
+            first_row = rows[0]
+            first_row_cols = first_row.find_all('td')
+            first_row_ths = first_row.find_all('th')
+            
+            if len(first_row_cols) < 7:
+                # 첫 번째 행이 헤더(th)인 경우 제외
+                original_count = len(rows)
+                rows = rows[1:]
+        
+        for idx, row in enumerate(rows):
             torrent_data = self.parse_torrent_item(row)
             if torrent_data:
                 torrents.append(torrent_data)
+            else:
+                # 첫 번째 행(index 0) 파싱 실패 시 디버그 정보 출력
+                if idx == 0:
+                    columns = row.find_all('td')
+                    print(f"[Sukebei] ⚠️ 첫 번째 행(index 0) 파싱 실패: columns={len(columns)}개")
+                    if len(columns) > 0:
+                        print(f"[Sukebei] 첫 번째 행 내용: {row.get_text(strip=True)[:100]}...")
+        
+        if len(rows) > 0 and len(torrents) == 0:
+            print(f"[Sukebei] ⚠️ 경고: {len(rows)}개 행을 찾았지만 파싱된 항목이 0개입니다.")
         
         return torrents
     
@@ -62,6 +96,9 @@ class SukebeiScraper(BaseScraper):
         try:
             columns = row.find_all('td')
             if len(columns) < 7:
+                # 디버그: 컬럼 수가 부족한 경우
+                if len(columns) > 0:
+                    print(f"[Sukebei] 파싱 스킵: 컬럼 수 부족 ({len(columns)}개, 최소 7개 필요)")
                 return None
             
             # 카테고리
@@ -74,6 +111,9 @@ class SukebeiScraper(BaseScraper):
             title_links = name_col.find_all('a')
             
             if not title_links:
+                # 디버그: 링크가 없는 경우
+                name_text = name_col.get_text(strip=True)
+                print(f"[Sukebei] 파싱 스킵: 제목 링크 없음 (이름 컬럼: {name_text[:50]}...)")
                 return None
             
             # 마지막 링크가 실제 제목
@@ -81,6 +121,11 @@ class SukebeiScraper(BaseScraper):
             title = title_link.get_text(strip=True)
             view_url = title_link.get('href', '')
             source_id = view_url.split('/')[-1] if view_url else ''
+            
+            if not source_id:
+                # source_id가 없으면 파싱 실패로 간주
+                print(f"[Sukebei] 파싱 스킵: source_id 없음 (제목: {title[:50]}..., URL: {view_url})")
+                return None
             
             # Magnet 링크
             magnet_link = ''
@@ -117,15 +162,29 @@ class SukebeiScraper(BaseScraper):
             leechers_col = columns[6]
             leechers = int(leechers_col.get_text(strip=True) or 0)
             
-            # Downloads
-            downloads_col = columns[7]
-            downloads = int(downloads_col.get_text(strip=True) or 0)
+            # Downloads (컬럼 인덱스 확인)
+            if len(columns) <= 7:
+                # downloads 컬럼이 없으면 0으로 설정
+                downloads = 0
+                print(f"[Sukebei] 경고: downloads 컬럼 없음 (컬럼 수: {len(columns)})")
+            else:
+                downloads_col = columns[7]
+                try:
+                    downloads_text = downloads_col.get_text(strip=True) or '0'
+                    # 쉼표 제거 (예: "202,178" -> "202178")
+                    downloads_text = downloads_text.replace(',', '')
+                    downloads = int(downloads_text)
+                except (ValueError, AttributeError) as e:
+                    downloads = 0
+                    print(f"[Sukebei] downloads 파싱 실패: {e} (텍스트: {downloads_col.get_text(strip=True) if downloads_col else 'None'})")
             
             # 국가 및 검열 여부 추측
             country, censored = self._detect_country_and_censorship(title, category)
             
             # 장르 추측
             genres = self._detect_genres(title)
+            
+            # 첫 번째 행 파싱 성공 여부는 scrape_page에서 확인 (enumerate로 idx 전달 필요)
             
             return {
                 'title': title,

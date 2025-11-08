@@ -1,0 +1,29 @@
+{
+  "keyword": "ZSD-74",
+  "min_bytes": 10240,
+  "base": "https://javbee.vip/search",
+  "search_url": "https://javbee.vip/search?keyword=ZSD-74",
+  "html_len": 31801,
+  "anchors_found": 1,
+  "used_card_index": 0,
+  "card_title_text": "[HD Uncensored] ZSD-74 尻伝説 篠田ゆう 5.2 GiB",
+  "card_title_match": true,
+  "raw_candidates": [
+    {
+      "url": "https://javbee.image-sky.com/wp-content/uploads/2022/04/ZSD-074-2.jpg",
+      "how": "data-src"
+    }
+  ],
+  "candidate_count": 1,
+  "accepted": [
+    {
+      "url": "https://javbee.image-sky.com/wp-content/uploads/2022/04/ZSD-074-2.jpg",
+      "saved": "test_images\\ZSD-74_01.jpg",
+      "size": 133545,
+      "ct": "image/jpeg",
+      "how": "data-src"
+    }
+  ],
+  "rejected": [],
+  "downloaded_count": 1
+}

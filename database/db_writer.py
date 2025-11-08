@@ -34,6 +34,7 @@ class DBWriterThread(QThread):
     # Signals
     operation_completed = Signal(str, bool, object)  # callback_id, success, result
     error_occurred = Signal(str, str)  # operation_type, error_message
+    batch_completed = Signal(dict)  # stats: {'added': int, 'updated': int, 'duplicate': int}
     
     def __init__(self, db):
         super().__init__()
@@ -89,6 +90,8 @@ class DBWriterThread(QThread):
         
         session = self.db.get_session()
         
+        processed_count = 0  # 처리한 작업 수
+        
         try:
             while self._running:
                 try:
@@ -97,6 +100,8 @@ class DBWriterThread(QThread):
                     
                     if operation is None:  # 종료 신호
                         break
+                    
+                    processed_count += 1
                     
                     success = False
                     result = None
@@ -114,13 +119,18 @@ class DBWriterThread(QThread):
                             result = operation.data['torrent_id']
                             
                         elif operation.op_type == WriteOperationType.BATCH_ADD_TORRENTS:
+                            torrent_count = len(operation.data['torrents'])
                             result = self._batch_add_torrents(session, operation.data['torrents'])
                             success = True
+                            # 배치 완료 시그널 발생
+                            if isinstance(result, dict):
+                                self.batch_completed.emit(result)
                             
                         elif operation.op_type == WriteOperationType.BATCH_UPDATE_THUMBNAILS:
+                            update_count = len(operation.data['updates'])
                             self._batch_update_thumbnails(session, operation.data['updates'])
                             success = True
-                            result = len(operation.data['updates'])
+                            result = update_count
                         
                         # 커밋
                         session.commit()
@@ -128,6 +138,9 @@ class DBWriterThread(QThread):
                     except Exception as e:
                         error_msg = str(e)
                         session.rollback()
+                        print(f"[DBWriter] ❌ 오류 발생: {error_msg} (타입: {operation.op_type.value})")
+                        import traceback
+                        traceback.print_exc()
                         self.error_occurred.emit(operation.op_type.value, error_msg)
                     
                     # 콜백 실행
@@ -137,9 +150,12 @@ class DBWriterThread(QThread):
                     self.queue.task_done()
                     
                 except Empty:
+                    # 타임아웃 - 정상적인 대기 상태
                     continue
                 except Exception as e:
-                    print(f"[DBWriter] 예상치 못한 오류: {e}")
+                    print(f"[DBWriter] ❌ 예상치 못한 오류: {e}")
+                    import traceback
+                    traceback.print_exc()
                     
         finally:
             session.close()
@@ -168,36 +184,106 @@ class DBWriterThread(QThread):
             ).first()
         
         if existing:
-            # 업데이트
+            # 중복 항목 발견 - 다운로드수 비교하여 업데이트 여부 결정
+            new_downloads = torrent_data.get('downloads', 0) or 0
+            existing_downloads = existing.downloads or 0
+            
+            # 새 항목의 다운로드수가 더 많으면 업데이트
+            if new_downloads > existing_downloads:
+                # 다운로드수가 더 많은 항목으로 업데이트
+                for key in ['downloads', 'seeders', 'leechers', 'completed', 'magnet_link', 'torrent_link', 'size', 'size_bytes']:
+                    if key in torrent_data:
+                        setattr(existing, key, torrent_data[key])
+                
+                # 썸네일이 없었는데 새로 생겼으면 업데이트
+                if not existing.thumbnail_url and torrent_data.get('thumbnail_url'):
+                    existing.thumbnail_url = torrent_data.get('thumbnail_url')
+                    existing.snapshot_urls = torrent_data.get('snapshot_urls', '')
+                
+                # 인기도 점수 재계산
+                existing.calculate_popularity()
+                return 'updated'
+            
+            # 기존 항목이 다운로드수가 더 많거나 같으면 중복으로 처리
+            # 단, _is_update 플래그가 있으면 통계 정보만 업데이트
             is_update = torrent_data.get('_is_update', False)
             if is_update:
                 for key in ['downloads', 'seeders', 'leechers', 'completed']:
                     if key in torrent_data:
                         setattr(existing, key, torrent_data[key])
+                existing.calculate_popularity()
                 return 'updated'
+            
             return 'duplicate'
         else:
             # 신규 추가
-            torrent = Torrent(**{k: v for k, v in torrent_data.items() if not k.startswith('_')})
+            # genres 필드는 별도 처리 (Many-to-Many 관계)
+            genres_list = torrent_data.get('genres', [])
+            
+            # genres를 제외한 나머지 필드로 Torrent 객체 생성
+            torrent_kwargs = {k: v for k, v in torrent_data.items() if not k.startswith('_') and k != 'genres'}
+            torrent = Torrent(**torrent_kwargs)
             session.add(torrent)
+            session.flush()  # ID를 얻기 위해 flush
+            
+            # genres 처리: 문자열 리스트를 Genre 객체로 변환
+            if genres_list:
+                from database.models import Genre
+                for genre_name in genres_list:
+                    if isinstance(genre_name, str) and genre_name.strip():
+                        # Genre 객체 찾기 또는 생성
+                        genre = session.query(Genre).filter_by(name=genre_name).first()
+                        if not genre:
+                            genre = Genre(name=genre_name)
+                            session.add(genre)
+                            session.flush()
+                        torrent.genres.append(genre)
+            
             return 'added'
     
     def _update_thumbnail(self, session, data: Dict[str, Any]):
         """썸네일 업데이트 (내부 메서드)"""
         from database.models import Torrent
         
-        torrent_id = data['torrent_id']
-        thumbnail_url = data['thumbnail_url']
+        torrent_id = data.get('torrent_id')
+        thumbnail_url = data.get('thumbnail_url', '')
         
-        torrent = session.get(Torrent, torrent_id)
-        if torrent:
-            torrent.thumbnail_url = thumbnail_url
+        # 타입 검증
+        if not torrent_id:
+            return
+        
+        if not isinstance(torrent_id, int):
+            try:
+                torrent_id = int(torrent_id)
+            except:
+                return
+        
+        if not isinstance(thumbnail_url, str):
+            thumbnail_url = str(thumbnail_url) if thumbnail_url else ''
+        
+        try:
+            # SQLAlchemy 1.4/2.0 호환 조회
+            try:
+                torrent = session.get(Torrent, torrent_id)
+            except Exception:
+                torrent = session.query(Torrent).get(torrent_id)
+            
+            if torrent:
+                # thumbnail_url이 문자열인지 확인
+                if not isinstance(thumbnail_url, str):
+                    thumbnail_url = str(thumbnail_url) if thumbnail_url else ''
+                
+                torrent.thumbnail_url = thumbnail_url
+            # torrent가 없으면 조용히 무시
+        except Exception as e:
+            print(f"[DBWriter] ⚠️ 썸네일 업데이트 오류 (torrent_id={torrent_id}): {e}")
+            raise
     
     def _batch_add_torrents(self, session, torrents: List[Dict[str, Any]]) -> Dict[str, int]:
         """배치 토렌트 추가"""
         stats = {'added': 0, 'updated': 0, 'duplicate': 0}
         
-        for torrent_data in torrents:
+        for idx, torrent_data in enumerate(torrents):
             result = self._add_torrent(session, torrent_data)
             stats[result] = stats.get(result, 0) + 1
         

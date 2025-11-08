@@ -7,6 +7,7 @@ import time
 import random
 import json
 import os
+import pathlib
 from urllib.parse import quote, urljoin
 from requests.exceptions import RequestException, ConnectionError, Timeout
 from config import ENABLE_JAVDB_FALLBACK, ENABLE_SELENIUM_FOR_IMAGES, IMAGE_HTTP_TIMEOUT, IMAGE_HTTP_RETRIES, PROXY_URL
@@ -220,7 +221,22 @@ class ImageFinder:
                 urls_http = self._search_javdb(title)
                 image_urls.extend(urls_http)
         
-        # JAVDB 실패 시 FC2PPV.stream 시도 (FC2 코드가 있을 때만)
+        # JAVDB 실패 시 JAVBee 시도
+        if not image_urls:
+            if codes:
+                for code in codes:
+                    urls = self._search_javbee(code, title=title)
+                    image_urls.extend(urls)
+                    if image_urls:
+                        break
+            elif fc2_codes:
+                for fc2_code in fc2_codes:
+                    urls = self._search_javbee(f"FC2-PPV-{fc2_code}", title=title)
+                    image_urls.extend(urls)
+                    if image_urls:
+                        break
+        
+        # JAVBee 실패 시 FC2PPV.stream 시도 (FC2 코드가 있을 때만)
         if not image_urls and fc2_codes:
             for fc2_code in fc2_codes:
                 urls = self._search_fc2ppv_stream(fc2_code)
@@ -246,6 +262,25 @@ class ImageFinder:
         if not url:
             return True
         url_lower = url.lower()
+        
+        # 아이콘 파일 차단 (favicon.ico, .ico 확장자 등)
+        if 'favicon' in url_lower or url_lower.endswith('.ico'):
+            return True
+        
+        # 기타 아이콘 관련 파일명 차단
+        icon_patterns = ['/icon.', '/icons/', '/favicon', 'apple-touch-icon', 'android-chrome']
+        if any(pattern in url_lower for pattern in icon_patterns):
+            return True
+        
+        # javbee.vip/storage/ 경로의 특정 이미지 차단 (썸네일이 아닌 이미지)
+        if 'javbee.vip/storage/' in url_lower:
+            return True
+        
+        # javbee.vip/images/loading.gif 차단 (로딩 이미지)
+        if 'javbee.vip/images/loading' in url_lower:
+            return True
+        
+        # 차단 리스트 확인
         for blocked in self.blocked_thumbnails:
             if blocked in url_lower:
                 return True
@@ -615,7 +650,7 @@ class ImageFinder:
                 if response.status_code == 403:
                     if not self.javlibrary_blocked:
                         self.javlibrary_blocked = True
-                        print(f"[ImageFinder] JAVLibrary HTTP 403 감지, 이후 모든 요청은 Selenium 사용")
+                        # HTTP 403 감지 시 Selenium으로 전환 (로그 생략)
                     if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
                         selenium_urls = self._search_javlibrary_selenium(code)
                         if selenium_urls:
@@ -673,8 +708,23 @@ class ImageFinder:
                                     img_src = f'https://www.javlibrary.com{img_src}'
                                 else:
                                     img_src = urljoin(f'https://www.javlibrary.com/{lang}/', img_src)
-                            if img_src.startswith('http'):
+                            # 실제 이미지 URL인지 확인
+                            is_image_url = (
+                                img_src.startswith('http') and
+                                (
+                                    any(img_src.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']) or
+                                    '/image' in img_src.lower() or 
+                                    '/img' in img_src.lower() or 
+                                    '/cover' in img_src.lower() or 
+                                    '/jacket' in img_src.lower() or
+                                    '/pl' in img_src.lower() or  # DMM 이미지 패턴
+                                    '/ps' in img_src.lower()    # DMM 이미지 패턴
+                                )
+                            )
+                            
+                            if is_image_url:
                                 image_urls.append(img_src)
+                            # 이미지가 아닌 URL은 스킵 (로그 생략)
                     
                     # DMM URL이 있으면 추가 (우선순위 높음)
                     if dmm_url:
@@ -714,7 +764,7 @@ class ImageFinder:
                 if response.status_code == 403:
                     if not self.javlibrary_blocked:
                         self.javlibrary_blocked = True
-                        print(f"[ImageFinder] JAVLibrary HTTP 403 감지, 이후 모든 요청은 Selenium 사용")
+                        # HTTP 403 감지 시 Selenium으로 전환 (로그 생략)
                     if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
                         selenium_urls = self._search_javlibrary_selenium(code)
                         if selenium_urls:
@@ -758,7 +808,7 @@ class ImageFinder:
                 if detail_response.status_code == 403:
                     if not self.javlibrary_blocked:
                         self.javlibrary_blocked = True
-                        print(f"[ImageFinder] JAVLibrary HTTP 403 감지, 이후 모든 요청은 Selenium 사용")
+                        # HTTP 403 감지 시 Selenium으로 전환 (로그 생략)
                     if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
                         selenium_urls = self._search_javlibrary_selenium(code)
                         if selenium_urls:
@@ -1131,45 +1181,142 @@ class ImageFinder:
                     except:
                         time.sleep(1.0)  # 대기 시간 증가
                     
+                    # 연령 확인/이용 약관 동의 팝업 처리
+                    try:
+                        # "동의한다" 버튼 찾기 (여러 방법 시도)
+                        agree_button = None
+                        # 방법 1: 텍스트로 찾기
+                        try:
+                            agree_button = driver.find_element(By.XPATH, "//button[contains(text(), '同意する')]")
+                        except:
+                            try:
+                                agree_button = driver.find_element(By.XPATH, "//a[contains(text(), '同意する')]")
+                            except:
+                                try:
+                                    agree_button = driver.find_element(By.XPATH, "//input[@value='同意する']")
+                                except:
+                                    pass
+                        
+                        # 방법 2: 클래스나 ID로 찾기
+                        if not agree_button:
+                            try:
+                                agree_button = driver.find_element(By.CSS_SELECTOR, "button.agree, a.agree, input.agree")
+                            except:
+                                try:
+                                    agree_button = driver.find_element(By.ID, "agree")
+                                except:
+                                    pass
+                        
+                        # 방법 3: 모달 내부의 버튼 찾기
+                        if not agree_button:
+                            try:
+                                # 모달이나 팝업 내부의 버튼 찾기
+                                modals = driver.find_elements(By.CSS_SELECTOR, "div[class*='modal'], div[class*='popup'], div[class*='dialog']")
+                                for modal in modals:
+                                    try:
+                                        buttons = modal.find_elements(By.TAG_NAME, "button")
+                                        for btn in buttons:
+                                            if '同意' in btn.text or 'agree' in btn.text.lower():
+                                                agree_button = btn
+                                                break
+                                        if agree_button:
+                                            break
+                                    except:
+                                        continue
+                            except:
+                                pass
+                        
+                        if agree_button:
+                            agree_button.click()
+                            time.sleep(1.0)  # 팝업 닫힌 후 페이지 로딩 대기
+                            print(f"[ImageFinder] JAVLibrary 연령 확인 팝업 처리 완료: {code}")
+                    except Exception as e:
+                        # 팝업이 없거나 이미 처리된 경우는 무시
+                        pass
+                    
                     # URL이 리다이렉트되었는지 확인
                     current_url = driver.current_url
                     if 'vl_searchbyid' in current_url or 'search' in current_url:
                         # 검색 결과 페이지로 리다이렉트된 경우
-                        page_source = driver.page_source
-                        soup = BeautifulSoup(page_source, 'lxml')
-                        
-                        # 검색 결과에서 작품 링크 찾기 (여러 방법 시도)
-                        video_link = None
-                        # 방법 1: class='video'인 a 태그
-                        video_link = soup.find('a', class_='video')
-                        # 방법 2: div.video 내부의 a 태그
-                        if not video_link:
-                            video_div = soup.find('div', class_='video')
-                            if video_div:
-                                video_link = video_div.find('a')
-                        # 방법 3: href에 code가 포함된 링크
-                        if not video_link:
-                            for a in soup.find_all('a', href=True):
-                                href = a.get('href', '')
-                                if code.upper() in href.upper() or code.lower() in href.lower():
-                                    video_link = a
-                                    break
-                        
-                        if video_link:
-                            href = video_link.get('href', '')
-                            if href:
-                                # 상대 URL 처리
-                                if href.startswith('/'):
-                                    video_url = f"https://www.javlibrary.com{href}"
-                                elif href.startswith('http'):
-                                    video_url = href
-                                else:
-                                    video_url = urljoin(f'https://www.javlibrary.com/{lang}/', href)
-                                
-                                # 상세 페이지로 이동
-                                driver.get(video_url)
-                                time.sleep(1.0)
+                        # Selenium으로 직접 링크 찾아서 클릭 시도
+                        try:
+                            # 방법 1: class='video'인 a 태그 찾기
+                            video_elements = driver.find_elements(By.CSS_SELECTOR, 'a.video')
+                            if not video_elements:
+                                # 방법 2: div.video 내부의 a 태그
+                                video_elements = driver.find_elements(By.CSS_SELECTOR, 'div.video a')
+                            if not video_elements:
+                                # 방법 3: href에 code가 포함된 링크
+                                video_elements = driver.find_elements(By.XPATH, f"//a[contains(@href, '{code.upper()}') or contains(@href, '{code.lower()}')]")
+                            
+                            if video_elements:
+                                # 첫 번째 링크 클릭
+                                video_elements[0].click()
+                                time.sleep(1.5)  # 클릭 후 페이지 로딩 대기
                                 current_url = driver.current_url
+                                print(f"[ImageFinder] JAVLibrary 검색 결과에서 링크 클릭 성공: {code}")
+                            else:
+                                # Selenium으로 못 찾았으면 BeautifulSoup으로 시도
+                                page_source = driver.page_source
+                                soup = BeautifulSoup(page_source, 'lxml')
+                                
+                                video_link = soup.find('a', class_='video')
+                                if not video_link:
+                                    video_div = soup.find('div', class_='video')
+                                    if video_div:
+                                        video_link = video_div.find('a')
+                                if not video_link:
+                                    for a in soup.find_all('a', href=True):
+                                        href = a.get('href', '')
+                                        if code.upper() in href.upper() or code.lower() in href.lower():
+                                            video_link = a
+                                            break
+                                
+                                if video_link:
+                                    href = video_link.get('href', '')
+                                    if href:
+                                        # 상대 URL 처리
+                                        if href.startswith('/'):
+                                            video_url = f"https://www.javlibrary.com{href}"
+                                        elif href.startswith('http'):
+                                            video_url = href
+                                        else:
+                                            video_url = urljoin(f'https://www.javlibrary.com/{lang}/', href)
+                                        
+                                        # 상세 페이지로 이동
+                                        driver.get(video_url)
+                                        time.sleep(1.0)
+                                        current_url = driver.current_url
+                        except Exception as e:
+                            # 클릭 실패 시 기존 방식으로 URL 이동
+                            page_source = driver.page_source
+                            soup = BeautifulSoup(page_source, 'lxml')
+                            
+                            video_link = soup.find('a', class_='video')
+                            if not video_link:
+                                video_div = soup.find('div', class_='video')
+                                if video_div:
+                                    video_link = video_div.find('a')
+                            if not video_link:
+                                for a in soup.find_all('a', href=True):
+                                    href = a.get('href', '')
+                                    if code.upper() in href.upper() or code.lower() in href.lower():
+                                        video_link = a
+                                        break
+                            
+                            if video_link:
+                                href = video_link.get('href', '')
+                                if href:
+                                    if href.startswith('/'):
+                                        video_url = f"https://www.javlibrary.com{href}"
+                                    elif href.startswith('http'):
+                                        video_url = href
+                                    else:
+                                        video_url = urljoin(f'https://www.javlibrary.com/{lang}/', href)
+                                    
+                                    driver.get(video_url)
+                                    time.sleep(1.0)
+                                    current_url = driver.current_url
                     
                     page_source = driver.page_source
                     soup = BeautifulSoup(page_source, 'lxml')
@@ -1216,10 +1363,26 @@ class ImageFinder:
                                     img_src = f'https://www.javlibrary.com{img_src}'
                                 else:
                                     img_src = urljoin(f'https://www.javlibrary.com/{lang}/', img_src)
-                            if img_src.startswith('http') and 'javlibrary' in img_src.lower():
+                            # 실제 이미지 URL인지 확인 (이미지 확장자 또는 이미지 경로 포함)
+                            is_image_url = (
+                                img_src.startswith('http') and 
+                                'javlibrary' in img_src.lower() and
+                                (
+                                    any(img_src.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']) or
+                                    '/image' in img_src.lower() or 
+                                    '/img' in img_src.lower() or 
+                                    '/cover' in img_src.lower() or 
+                                    '/jacket' in img_src.lower() or
+                                    '/pl' in img_src.lower() or  # DMM 이미지 패턴
+                                    '/ps' in img_src.lower()    # DMM 이미지 패턴
+                                )
+                            )
+                            
+                            if is_image_url:
                                 image_urls.append(img_src)
-                                print(f"[ImageFinder] JAVLibrary에서 이미지 발견 (Selenium, 직접 URL, {lang}): {code}")
+                                print(f"[ImageFinder] JAVLibrary에서 이미지 발견 (Selenium, 직접 URL, {lang}): {code} -> {img_src[:80]}...")
                                 return image_urls  # 찾았으면 바로 반환
+                            # 이미지가 아닌 URL은 스킵 (로그 생략)
                 except Exception as e:
                     # 직접 URL 실패는 조용히 넘어감 (다음 방법 시도)
                     pass
@@ -1237,6 +1400,53 @@ class ImageFinder:
                         )
                     except:
                         time.sleep(1.0)
+                    
+                    # 연령 확인/이용 약관 동의 팝업 처리
+                    try:
+                        agree_button = None
+                        try:
+                            agree_button = driver.find_element(By.XPATH, "//button[contains(text(), '同意する')]")
+                        except:
+                            try:
+                                agree_button = driver.find_element(By.XPATH, "//a[contains(text(), '同意する')]")
+                            except:
+                                try:
+                                    agree_button = driver.find_element(By.XPATH, "//input[@value='同意する']")
+                                except:
+                                    pass
+                        
+                        if not agree_button:
+                            try:
+                                agree_button = driver.find_element(By.CSS_SELECTOR, "button.agree, a.agree, input.agree")
+                            except:
+                                try:
+                                    agree_button = driver.find_element(By.ID, "agree")
+                                except:
+                                    pass
+                        
+                        if not agree_button:
+                            try:
+                                modals = driver.find_elements(By.CSS_SELECTOR, "div[class*='modal'], div[class*='popup'], div[class*='dialog']")
+                                for modal in modals:
+                                    try:
+                                        buttons = modal.find_elements(By.TAG_NAME, "button")
+                                        for btn in buttons:
+                                            if '同意' in btn.text or 'agree' in btn.text.lower():
+                                                agree_button = btn
+                                                break
+                                        if agree_button:
+                                            break
+                                    except:
+                                        continue
+                            except:
+                                pass
+                        
+                        if agree_button:
+                            agree_button.click()
+                            time.sleep(1.0)
+                            print(f"[ImageFinder] JAVLibrary 연령 확인 팝업 처리 완료 (검색 페이지): {code}")
+                    except Exception as e:
+                        pass
                     
                     page_source = driver.page_source
                     soup = BeautifulSoup(page_source, 'lxml')
@@ -1408,6 +1618,274 @@ class ImageFinder:
                 except:
                     pass
                 self.selenium_driver = None
+            return []
+    
+    def _search_javbee(self, query: str, title: str = None) -> List[str]:
+        """javbee.vip에서 이미지 검색 (test.py 로직 기반)
+        
+        Args:
+            query: 검색 쿼리 (작품번호 등)
+            title: 원본 제목 (로그 출력용)
+        """
+        try:
+            # 검색어 정제 (FC2-PPV-숫자 또는 JAV 코드)
+            search_query = query.strip()
+            display_title = title[:50] + "..." if title and len(title) > 50 else (title or search_query)
+            
+            # javbee.vip 검색 URL
+            search_url = f"https://javbee.vip/search?keyword={quote(search_query)}"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://javbee.vip/'
+            }
+            
+            response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
+            if not response or response.status_code != 200:
+                print(f"[ImageFinder] JAVBee 검색 페이지 접근 실패 (제목: {display_title}): {response.status_code if response else 'No response'}")
+                return []
+            
+            soup = BeautifulSoup(response.content, 'lxml')
+            image_urls = []
+            
+            # test.py 로직 기반 함수들
+            def compile_keyword_strict(keyword: str):
+                """
+                '문자+숫자'가 정확히 같고, 문자/숫자 사이의 '-' 만 옵션.
+                예) 'STARS-080' -> (?<!alnum)STARS-?080(?!alnum)
+                """
+                m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", keyword.strip())
+                if not m:
+                    k = keyword.strip()
+                    k = re.escape(k).replace(r"\-", "-?")
+                    return re.compile(rf"(?<![A-Za-z0-9]){k}(?![A-Za-z0-9])", re.I)
+                prefix, num = m.groups()
+                return re.compile(
+                    rf"(?<![A-Za-z0-9]){re.escape(prefix)}-?{re.escape(num)}(?![A-Za-z0-9])",
+                    re.I,
+                )
+            
+            # 카드 타이틀(제목) 찾기
+            ignore_title_words_re = re.compile(r"(show\s*screenshot|torrent|magnet)", re.I)
+            
+            def find_card_title_text(anchor, max_up=6):
+                """
+                'Show Screenshot' 앵커를 기준으로, 같은 카드의 제목 텍스트를 찾아 반환.
+                - 우선: 앵커의 이전 형제들 중 텍스트가 긴 <a>/<h1..h6>.
+                - 대안: 부모로 올라가며 그 안에서 후보 찾기(최대 max_up 단계).
+                """
+                # 1) 이전 형제 스캔
+                for sib in anchor.previous_siblings:
+                    name = getattr(sib, "name", None)
+                    if name in ("a", "h1", "h2", "h3", "h4", "h5", "h6"):
+                        txt = sib.get_text(" ", strip=True) or ""
+                        if txt and not ignore_title_words_re.search(txt) and len(txt) >= 6:
+                            return txt
+                    if getattr(sib, "find_all", None):
+                        for cand in sib.find_all(["a", "h1", "h2", "h3", "h4", "h5", "h6"]):
+                            txt = cand.get_text(" ", strip=True) or ""
+                            if txt and not ignore_title_words_re.search(txt) and len(txt) >= 6:
+                                return txt
+                # 2) 부모로 상승하며 내부에서 찾기
+                node = anchor
+                for _ in range(max_up):
+                    node = getattr(node, "parent", None)
+                    if node is None:
+                        break
+                    for cand in node.find_all(["a", "h1", "h2", "h3", "h4", "h5", "h6"]):
+                        txt = cand.get_text(" ", strip=True) or ""
+                        if txt and not ignore_title_words_re.search(txt) and len(txt) >= 6:
+                            return txt
+                return None
+            
+            # uploads/upload 경로만 허용
+            uploads_re = re.compile(r"/(?:wp-content/)?uploads?/", re.I)
+            
+            # 자산(logo/favicon/icon/banner/ads 등) 세그먼트 기준 필터
+            asset_seg_re = re.compile(
+                r"(?:^|/)(?:logo|favicon|sprite|icons?|ads?|banners?|static|assets|themes|emoji|svg)(?:/|$)",
+                re.I
+            )
+            
+            def is_probably_asset(url: str) -> bool:
+                """경로 세그먼트 기준으로 자산인지 확인"""
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    path = parsed.path
+                    return bool(asset_seg_re.search(path))
+                except Exception:
+                    return False
+            
+            def img_candidate_urls(img_tag, base_url: str):
+                """img 태그에서 모든 가능한 이미지 URL 추출 (src, data-src, data-original, srcset)"""
+                cands = []
+                def add(u, how):
+                    if u:
+                        full_url = urljoin(base_url, u)
+                        cands.append({"url": full_url, "how": how})
+                
+                add(img_tag.get("src"), "src")
+                add(img_tag.get("data-src"), "data-src")
+                add(img_tag.get("data-original"), "data-original")
+                
+                # srcset → 해상도 큰 후보(뒤쪽)를 우선으로
+                srcset = img_tag.get("srcset")
+                if srcset:
+                    parts = [p.strip() for p in srcset.split(",") if p.strip()]
+                    # 큰 것부터 시도하도록 역순
+                    for p in reversed(parts):
+                        url_part = p.split()[0] if p.split() else p
+                        add(url_part, "srcset")
+                
+                # 중복 제거
+                seen, uniq = set(), []
+                for item in cands:
+                    if item["url"] not in seen:
+                        uniq.append(item)
+                        seen.add(item["url"])
+                return uniq
+            
+            def closest_container_with_images(anchor):
+                """앵커에서 가장 가까운 컨테이너와 이미지 찾기"""
+                node = anchor
+                for _ in range(6):
+                    if node is None:
+                        break
+                    if hasattr(node, "find_all"):
+                        imgs = node.find_all("img")
+                        if imgs:
+                            return node, imgs
+                    node = getattr(node, "parent", None)
+                return None, []
+            
+            def images_in_previous_siblings(anchor):
+                """앵커의 이전 형제에서 이미지 찾기"""
+                imgs = []
+                for sib in anchor.previous_siblings:
+                    if hasattr(sib, "find_all"):
+                        imgs.extend(sib.find_all("img"))
+                    elif hasattr(sib, "name") and sib.name == "img":
+                        imgs.append(sib)
+                return imgs
+            
+            def find_show_screenshot_anchors(soup: BeautifulSoup):
+                """'Show Screenshot' 텍스트가 있는 앵커/버튼 찾기"""
+                anchors = []
+                for t in soup.find_all(["a", "button"]):
+                    txt = t.get_text(" ", strip=True) or ""
+                    if re.search(r"\bshow\s*screens?hot\b", txt, re.I):
+                        anchors.append(t)
+                # 중복 제거
+                seen, uniq = set(), []
+                for a in anchors:
+                    k = str(a)
+                    if k not in seen:
+                        uniq.append(a)
+                        seen.add(k)
+                return uniq
+            
+            # test.py 로직: "Show Screenshot" 앵커를 기준으로 같은 카드의 이미지 찾기
+            anchors = find_show_screenshot_anchors(soup)
+            
+            if not anchors:
+                print(f"[ImageFinder] JAVBee 'Show Screenshot' 앵커를 찾을 수 없음 - 이미지 없음으로 처리 (제목: {display_title})")
+                return []  # 앵커가 없으면 즉시 반환하여 다른 서버에서 검색하도록 함
+            
+            # 첫 번째 카드만 사용 (test.py 로직)
+            anchor = anchors[0]
+            print(f"[ImageFinder] JAVBee 'Show Screenshot' 앵커 {len(anchors)}개 발견, 첫 번째 카드 사용 (제목: {display_title})")
+            
+            # 카드 제목 추출 & 키워드 엄격 매칭
+            title_text = find_card_title_text(anchor)
+            kw_re = compile_keyword_strict(search_query)
+            title_ok = bool(title_text and kw_re.search(title_text))
+            
+            if not title_ok:
+                print(f"[ImageFinder] JAVBee 카드 제목 불일치 - 이미지 없음으로 처리 (제목: {display_title}, 카드제목: {title_text})")
+                return []  # 제목이 키워드와 일치하지 않으면 즉시 반환
+            
+            print(f"[ImageFinder] JAVBee 카드 제목 매칭 성공 (제목: {display_title}, 카드제목: {title_text})")
+            
+            # 카드의 좌측 이미지 영역에서 후보 수집
+            all_img_tags = []
+            # 이전 형제에서 이미지 찾기
+            all_img_tags.extend(images_in_previous_siblings(anchor))
+            # 가장 가까운 컨테이너에서 이미지 찾기
+            _, imgs = closest_container_with_images(anchor)
+            all_img_tags.extend(imgs)
+            
+            # 후보 URL 만들기
+            cand_urls = []
+            for img in all_img_tags:
+                cand_urls.extend(img_candidate_urls(img, search_url))
+            
+            # 중복 제거
+            uniq_urls, seen = [], set()
+            for c in cand_urls:
+                if c["url"] not in seen:
+                    uniq_urls.append(c)
+                    seen.add(c["url"])
+            
+            # 필터링: uploads/upload 경로 선호, 자산 제외 (파일명에 키워드가 없어도 OK - 제목으로 이미 검증됨)
+            filtered = []
+            for c in uniq_urls:
+                u = c["url"]
+                
+                # javbee.vip/storage/ 경로 차단
+                if 'javbee.vip/storage/' in u.lower():
+                    continue
+                
+                # javbee.vip/images/loading 차단
+                if 'javbee.vip/images/loading' in u.lower():
+                    continue
+                
+                # 자산 필터링 (경로 세그먼트 기준)
+                if is_probably_asset(u):
+                    continue
+                
+                # uploads/upload 경로 선호 (필수는 아님)
+                from urllib.parse import urlparse
+                path = urlparse(u).path
+                # uploads가 아니더라도 이미지 확장자가 있으면 허용 (제목으로 이미 검증됨)
+                path_ext = pathlib.Path(path).suffix.lower()
+                if not uploads_re.search(path) and path_ext not in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                    continue
+                
+                filtered.append(c)
+            
+            # 필터링된 URL을 image_urls에 추가
+            for c in filtered:
+                u = c["url"]
+                if u not in image_urls:
+                    # javbee.image-sky.com/wp-content/uploads/ 경로는 최우선
+                    if 'javbee.image-sky.com' in u.lower() and 'wp-content/uploads/' in u.lower():
+                        image_urls.insert(0, u)
+                        print(f"[ImageFinder] JAVBee에서 이미지 발견 (Show Screenshot, javbee.image-sky.com) - 제목: {display_title}")
+                        print(f"  URL: {u}")
+                    else:
+                        image_urls.append(u)
+                        print(f"[ImageFinder] JAVBee에서 이미지 발견 (Show Screenshot) - 제목: {display_title}")
+                        print(f"  URL: {u}")
+                    if len(image_urls) >= 3:
+                        break
+            
+            # test.py 로직: 상세 페이지 방문하지 않음, 검색 결과 페이지에서만 찾음
+            
+            if image_urls:
+                print(f"[ImageFinder] JAVBee 검색 성공: {len(image_urls)}개 이미지 발견 (제목: {display_title})")
+            else:
+                print(f"[ImageFinder] JAVBee 검색 결과 없음: {search_query} (제목: {display_title})")
+            
+            return image_urls[:3]
+            
+        except Exception as e:
+            display_title = title[:50] + "..." if title and len(title) > 50 else (title or query.strip())
+            print(f"[ImageFinder] JAVBee 검색 실패 (제목: {display_title}): {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     def __del__(self):

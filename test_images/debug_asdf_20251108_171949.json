@@ -1,0 +1,11 @@
+{
+  "keyword": "asdf",
+  "min_bytes": 10240,
+  "base": "https://javbee.vip/search",
+  "search_url": "https://javbee.vip/search?keyword=asdf",
+  "html_len": 27679,
+  "anchors_found": 0,
+  "error": "no_show_screenshot_anchor",
+  "candidate_count": 0,
+  "card_title_text": null
+}

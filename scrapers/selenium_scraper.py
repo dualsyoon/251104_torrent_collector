@@ -154,7 +154,7 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
         # 1_1: JAV (무검열), 1_2: JAV (검열), 1_3: JAV (Raw)
         self.av_categories = ['1_1', '1_2', '1_3']
     
-    def scrape_page(self, page: int = 1, sort_by: str = 'seeders', order: str = 'desc', category: Optional[str] = None) -> List[Dict]:
+    def scrape_page(self, page: int = 1, sort_by: str = 'seeders', order: str = 'desc', category: Optional[str] = None, query: Optional[str] = None) -> List[Dict]:
         """페이지에서 토렌트 정보 스크래핑
         
         Args:
@@ -162,6 +162,7 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
             sort_by: 정렬 기준
             order: 정렬 순서
             category: 카테고리 (AV만: 1_1, 1_2, 1_3)
+            query: 검색어 (예: 'gachi')
             
         Returns:
             토렌트 정보 딕셔너리 리스트
@@ -172,10 +173,12 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
             print(f"[{self.name}] 다음 페이지 요청 전 {delay:.1f}초 대기 중...")
             time.sleep(delay)
         
-        # URL 구성 (AV 카테고리만)
-        # Sukebei 카테고리 코드 확인 필요 - Live Action 카테고리 코드가 다를 수 있음
-        # 일단 전체에서 수집하고 카테고리로 필터링하는 방식으로 변경
-        if category:
+        # URL 구성
+        # 검색어가 있으면 검색 URL 사용
+        if query:
+            from urllib.parse import quote
+            url = f"{self.base_url}/?f=0&c=0_0&q={quote(query)}&s={sort_by}&o={order}&p={page}"
+        elif category:
             url = f"{self.base_url}/?f=0&c={category}&p={page}&s={sort_by}&o={order}"
         else:
             # 전체에서 수집 (카테고리 필터는 나중에)
@@ -219,21 +222,27 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
         
         # 첫 번째 행이 헤더일 수 있으므로 확인
         if rows and len(rows) > 0:
-            first_row_cols = rows[0].find_all('td')
+            first_row = rows[0]
+            first_row_cols = first_row.find_all('td')
+            first_row_ths = first_row.find_all('th')
+            
             if len(first_row_cols) == 0:
                 # 첫 번째 행이 헤더(th)인 경우 제외
+                original_count = len(rows)
                 rows = rows[1:]
-                print(f"[{self.name}] 헤더 행 제외, 실제 데이터: {len(rows)}개")
         
         processed_count = 0
         filtered_count = 0
         no_magnet_count = 0
         category_stats = {}  # 카테고리별 통계
         
-        for row in rows:
+        for idx, row in enumerate(rows):
             try:
                 columns = row.find_all('td')
                 if len(columns) < 7:
+                    # 첫 번째 행이면 디버그 정보 출력
+                    if idx == 0:
+                        print(f"[{self.name}] ⚠️ 첫 번째 행(index 0) 컬럼 수 부족: {len(columns)}개 (최소 7개 필요)")
                     continue
                 
                 # 카테고리
@@ -360,7 +369,15 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
                 # Seeders, Leechers, Downloads
                 seeders = int(columns[5].get_text(strip=True) or 0)
                 leechers = int(columns[6].get_text(strip=True) or 0)
-                downloads = int(columns[7].get_text(strip=True) or 0)
+                # Downloads 파싱 (쉼표 제거)
+                downloads_text = columns[7].get_text(strip=True) or '0'
+                downloads_text = downloads_text.replace(',', '')  # 쉼표 제거 (예: "202,178" -> "202178")
+                try:
+                    downloads = int(downloads_text)
+                except ValueError:
+                    downloads = 0
+                    print(f"[{self.name}] downloads 파싱 실패: '{downloads_text}'")
+                
                 
                 # 국가 및 검열 여부
                 country, censored = self._detect_country_and_censorship(title)
@@ -390,7 +407,15 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
                 })
                 
             except Exception as e:
-                print(f"[{self.name}] 토렌트 파싱 오류: {e}")
+                # 첫 번째 행(index 0) 파싱 실패 시 상세 디버그 정보 출력
+                if idx == 0:
+                    print(f"[{self.name}] ⚠️ 첫 번째 행(index 0) 파싱 오류: {e}")
+                    columns = row.find_all('td')
+                    print(f"[{self.name}] 첫 번째 행 컬럼 수: {len(columns)}개")
+                    if len(columns) > 0:
+                        print(f"[{self.name}] 첫 번째 행 내용: {row.get_text(strip=True)[:100]}...")
+                else:
+                    print(f"[{self.name}] 토렌트 파싱 오류 (행 {idx}): {e}")
                 continue
         
         print(f"[{self.name}] 처리 완료: 총 {len(rows)}개 중 {processed_count}개 수집, {filtered_count}개 필터링, {no_magnet_count}개 마그넷 링크 없음")

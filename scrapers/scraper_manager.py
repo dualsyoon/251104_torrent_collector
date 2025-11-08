@@ -212,7 +212,7 @@ class ScraperManager:
         
         return all_torrents
     
-    def scrape_source_smart(self, source_key: str, db, max_pages: int = 100, stop_on_duplicate: bool = True, stop_callback=None, progress_callback=None) -> List[Dict]:
+    def scrape_source_smart(self, source_key: str, db, max_pages: int = 100, stop_on_duplicate: bool = True, stop_callback=None, progress_callback=None, query: str = None, db_writer=None) -> List[Dict]:
         """스마트 스크래핑: 페이지별로 중복 체크하여 중복 발견 시 중단
         
         Args:
@@ -257,7 +257,10 @@ class ScraperManager:
                 # 첫 페이지를 먼저 스크래핑하여 source_site 확인
                 sort_by = source.get('sort_by', 'seeders')
                 order = source.get('order', 'desc')
-                test_page = scraper.scrape_page(page=1, sort_by=sort_by, order=order)
+                # 검색어: 함수 파라미터가 우선, 없으면 소스 설정에서 가져오기
+                search_query = query if query is not None else source.get('query', None)
+                category = source.get('category', None)  # 카테고리
+                test_page = scraper.scrape_page(page=1, sort_by=sort_by, order=order, query=search_query, category=category)
                 if not test_page:
                     print(f"[{source['name']}] 첫 페이지에 데이터 없음")
                     return []
@@ -306,6 +309,12 @@ class ScraperManager:
                 
                 print(f"  ✓ 페이지 1: 신규 {page_new}개, 업데이트 {page_duplicates}개")
                 
+                # db_writer가 있으면 첫 페이지도 실시간 저장
+                if db_writer:
+                    batch_torrents = [t for t in test_page if t.get('source_id')]
+                    if batch_torrents:
+                        db_writer.batch_add_torrents(batch_torrents)
+                
                 # 페이지별로 스크래핑 (2페이지부터)
                 for page in range(2, max_pages + 1):
                     # 진행률 보고
@@ -320,7 +329,7 @@ class ScraperManager:
                     print(f"  페이지 {page} 수집 중...")
                     
                     # 스크래핑
-                    page_torrents = scraper.scrape_page(page=page, sort_by=sort_by, order=order)
+                    page_torrents = scraper.scrape_page(page=page, sort_by=sort_by, order=order, query=search_query, category=category)
                     
                     if not page_torrents:
                         print(f"  페이지 {page}에 데이터 없음 - 중단")
@@ -354,10 +363,28 @@ class ScraperManager:
                     
                     print(f"  ✓ 페이지 {page}: 신규 {page_new}개, 업데이트 {page_duplicates}개")
                     
+                    # db_writer가 있으면 실시간으로 큐에 추가 (비동기 저장)
+                    if db_writer:
+                        batch_torrents = [t for t in page_torrents if t.get('source_id')]
+                        if batch_torrents:
+                            db_writer.batch_add_torrents(batch_torrents)
+                    
                     # 중복 체크 로직 제거 - 모든 페이지를 계속 읽음
                     # 시드/다운로드 수 등의 필드가 업데이트될 수 있으므로
                 
-                print(f"[{source['name']}] 총 {len(all_torrents)}개 수집 완료 (중복 제외)")
+                print(f"[{source['name']}] 총 {len(all_torrents)}개 수집 완료")
+                
+                # db_writer를 사용한 경우, 큐에 남은 작업이 완료될 때까지 대기
+                if db_writer:
+                    queue_size = db_writer.queue.qsize()
+                    print(f"[{source['name']}] DB 저장 큐 완료 대기 중... (큐 크기: {queue_size})")
+                    if queue_size > 0:
+                        db_writer.queue.join()  # 모든 작업이 완료될 때까지 대기
+                        print(f"[{source['name']}] DB 저장 완료 (큐 처리 완료)")
+                    else:
+                        print(f"[{source['name']}] ⚠️ DB 저장 큐가 비어있습니다. 작업이 큐에 추가되지 않았을 수 있습니다.")
+                else:
+                    print(f"[{source['name']}] ⚠️ db_writer가 None입니다!")
             
             finally:
                 session.close()
