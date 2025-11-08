@@ -50,6 +50,17 @@ class FilterPanel(QWidget):
         self.search_input.returnPressed.connect(self.on_filter_changed)
         search_layout.addWidget(self.search_input)
         
+        # 추천 검색어 버튼들
+        recommended_layout = QHBoxLayout()
+        recommended_keywords = ["uncen", "漏れ", "無修正"]
+        for keyword in recommended_keywords:
+            btn = QPushButton(keyword)
+            btn.setMaximumWidth(60)
+            btn.clicked.connect(lambda checked, kw=keyword: self._set_search_keyword(kw))
+            recommended_layout.addWidget(btn)
+        recommended_layout.addStretch()
+        search_layout.addLayout(recommended_layout)
+        
         search_btn = QPushButton("🔍 검색")
         search_btn.clicked.connect(self.on_filter_changed)
         search_layout.addWidget(search_btn)
@@ -63,6 +74,11 @@ class FilterPanel(QWidget):
         layout.addWidget(reset_btn)
         
         layout.addStretch()
+    
+    def _set_search_keyword(self, keyword: str):
+        """추천 검색어 버튼 클릭 시 검색어 설정"""
+        self.search_input.setText(keyword)
+        self.on_filter_changed()
     
     def on_filter_changed(self):
         """필터 변경 이벤트"""

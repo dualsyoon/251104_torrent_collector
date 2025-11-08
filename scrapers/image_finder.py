@@ -1791,8 +1791,8 @@ class ImageFinder:
             anchors = find_show_screenshot_anchors(soup)
             
             if not anchors:
-                print(f"[ImageFinder] JAVBee 'Show Screenshot' 앵커를 찾을 수 없음 - 이미지 없음으로 처리 (제목: {display_title})")
-                return []  # 앵커가 없으면 즉시 반환하여 다른 서버에서 검색하도록 함
+                # 앵커가 없으면 즉시 반환하여 다른 서버에서 검색하도록 함 (로그 생략)
+                return []
             
             # 첫 번째 카드만 사용 (test.py 로직)
             anchor = anchors[0]
