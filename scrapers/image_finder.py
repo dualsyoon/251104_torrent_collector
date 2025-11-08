@@ -43,6 +43,7 @@ class ImageFinder:
         # enable_javdb가 True이면 항상 활성화 상태로 시작
         self.javdb_available = True if self.enable_javdb else False
         self.javdb_fail_count = 0
+        self.javdb_403_count = 0  # 연속 403 응답 카운트
         
         # JAVLibrary HTTP 차단 감지 플래그
         self.javlibrary_blocked = False  # HTTP 403이 발생하면 True로 설정
@@ -329,14 +330,14 @@ class ImageFinder:
             else:  # 없으면 FC2-숫자
                 codes.append(f"FC2-{fc2_num}")
         
-        # 일반 AV 코드 패턴 (예: IPX-358, MIDA-398, COGM-089, STARS-573)
-        # 문자 길이를 1~10자로 확장하여 다양한 케이스 지원
-        pattern_av = r'([A-Z]{1,10})[-\s]?(\d{3,6})(?=[^\w]|$)'
-        matches_av = re.findall(pattern_av, title_upper)
+        # 숫자-문자-숫자 패턴 (예: 4017-PPV147, 4092-PPV352, 4092-PPV-352)
+        # 숫자로 시작하는 패턴을 먼저 확인 (더 구체적인 코드일 가능성이 높음)
+        pattern_num_alpha_num = r'(\d{3,5})[-\s]?([A-Z]{2,10})[-\s]?(\d{3,6})(?=[^\w]|$)'
+        # 원본 형식을 유지하기 위해 finditer 사용
+        matches_num_alpha_num = re.finditer(pattern_num_alpha_num, title_upper)
         
         # 제외할 키워드 목록 (코덱, 포맷, 프로토콜 등)
-        # FC2는 이미 별도 패턴으로 처리되므로 일반 패턴에서 제외
-        excluded_prefixes = {
+        excluded_alpha = {
             'HTTP', 'HTTPS', 'HTML', 'URL', 'API', 'JPG', 'PNG', 'MP4', 'MKV', 
             # 비디오 코덱/인코더
             'H265', 'H264', 'H-265', 'H-264', 'HEVC', 'AVC',
@@ -351,20 +352,55 @@ class ImageFinder:
             'BLU', 'RAY', 'DVD', 'ISO', 'RAR', 'ZIP', '7Z'
         }
         
+        for match_obj in matches_num_alpha_num:
+            num_prefix, alpha, number = match_obj.groups()
+            # 원본 형식 그대로 사용 (대문자로 변환, 공백은 하이픈으로)
+            code = match_obj.group(0).replace(' ', '-').upper()
+            
+            # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
+            if alpha not in excluded_alpha:
+                # 숫자가 너무 작거나 크면 제외 (작품번호는 보통 3-6자리)
+                if len(number) >= 3 and len(number) <= 6:
+                    codes.append(code)
+        
+        # 문자-숫자-문자 패턴 (예: MXNB-001S, IPX-123A) - 숫자 뒤에 문자가 있는 경우
+        pattern_av_suffix = r'([A-Z]{1,10})[-\s]?(\d{3,6})[-\s]?([A-Z]{1,3})(?=[^\w]|$)'
+        matches_av_suffix = re.finditer(pattern_av_suffix, title_upper)
+        
+        for match_obj in matches_av_suffix:
+            prefix, number, suffix = match_obj.groups()
+            # 원본 형식 그대로 사용 (대문자로 변환, 공백은 하이픈으로)
+            code = match_obj.group(0).replace(' ', '-').upper()
+            
+            # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
+            if prefix not in excluded_alpha:
+                # 숫자가 너무 작거나 크면 제외 (작품번호는 보통 3-6자리)
+                if len(number) >= 3 and len(number) <= 6:
+                    codes.append(code)
+        
+        # 일반 AV 코드 패턴 (예: IPX-358, MIDA-398, COGM-089, STARS-573)
+        # 문자 길이를 1~10자로 확장하여 다양한 케이스 지원
+        pattern_av = r'([A-Z]{1,10})[-\s]?(\d{3,6})(?=[^\w]|$)'
+        matches_av = re.finditer(pattern_av, title_upper)
+        
         # 전체 코드 형태로도 제외할 목록 (코덱 정보 등)
         excluded_codes = {
             'H-265', 'H-264', 'H265', 'H264',
             'X-265', 'X-264', 'X265', 'X264'
         }
         
-        for match in matches_av:
-            prefix, number = match
-            # 전체 코드 형태 생성
-            code = f"{prefix}-{number}"
+        for match_obj in matches_av:
+            prefix, number = match_obj.groups()
+            # 원본 형식 그대로 사용 (대문자로 변환, 공백은 하이픈으로)
+            code = match_obj.group(0).replace(' ', '-').upper()
+            
+            # 이미 문자-숫자-문자 패턴으로 추가된 코드는 제외
+            if code in codes:
+                continue
             
             # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
             # prefix와 전체 code 모두 체크 (FC2는 이미 별도 패턴으로 처리되므로 제외)
-            if prefix not in excluded_prefixes and code.upper() not in excluded_codes:
+            if prefix not in excluded_alpha and code.upper() not in excluded_codes:
                 # FC2는 이미 별도 패턴으로 처리했으므로 일반 패턴에서는 제외
                 if prefix == 'FC2':
                     continue
@@ -917,16 +953,11 @@ class ImageFinder:
     def _search_javdb(self, code: str) -> List[str]:
         """JAVDB.com에서 이미지 검색 (test_javdb_cover_search.py 기반)"""
         if not self.javdb_available:
-            print(f"[ImageFinder] JAVDB 비활성화됨 (코드: {code})")
             return []
-        print(f"[ImageFinder] JAVDB 검색 시작: {code}")
         try:
             # JAVDB 미러 도메인 목록
             javdb_bases = [
                 "https://javdb.com",
-                "https://javdb5.com",
-                "https://javdb7.com",
-                "https://javdb9.com",
             ]
             
             # cloudscraper 사용 가능 여부 확인
@@ -937,17 +968,22 @@ class ImageFinder:
             except ImportError:
                 pass
             
-            # HTTP 클라이언트 생성
+            # HTTP 클라이언트 생성 (cloudscraper 우선 사용)
+            session = None
             if use_cloudscraper:
                 try:
                     import cloudscraper
                     session = cloudscraper.create_scraper(
                         browser={"browser": "chrome", "platform": "windows", "mobile": False}
                     )
-                except Exception:
-                    session = self.session
-            else:
-                session = self.session
+                    print(f"[ImageFinder] JAVDB: cloudscraper 사용")
+                except Exception as e:
+                    print(f"[ImageFinder] JAVDB: cloudscraper 실패, requests 사용: {e}")
+                    session = None
+            
+            if session is None:
+                session = requests.Session()
+                print(f"[ImageFinder] JAVDB: requests.Session 사용")
             
             # 세션 헤더 설정
             session.headers.update({
@@ -960,7 +996,7 @@ class ImageFinder:
             })
             
             # 쿠키 설정
-            for dom in [".javdb.com", ".javdb5.com", ".javdb7.com", ".javdb9.com"]:
+            for dom in [".javdb.com"]:
                 try:
                     session.cookies.set("over18", "1", domain=dom)
                 except Exception:
@@ -978,22 +1014,35 @@ class ImageFinder:
                     session.get(base + "/", headers={"Referer": base + "/"}, timeout=20)
                     # 검색 요청
                     r = session.get(url, headers={"Referer": base + "/"}, timeout=25, allow_redirects=True)
-                    # 403이면 재시도
+                    # 403 응답이면 재시도 (테스트 코드 로직)
                     if r.status_code == 403:
-                        time.sleep(1.2)
+                        time.sleep(1.2)  # 403 발생 시 대기
+                        # 홈 워밍업 재시도
                         session.get(base + "/", headers={"Referer": base + "/"}, timeout=20)
+                        # 검색 요청 재시도
                         r = session.get(url, headers={"Referer": base + "/"}, timeout=25, allow_redirects=True)
+                        # 재시도 후에도 403이면 카운트 증가
+                        if r.status_code == 403:
+                            self.javdb_403_count += 1
+                            print(f"[ImageFinder] JAVDB 403 응답 ({self.javdb_403_count}/10): {base} (재시도 후에도 실패)")
+                            if self.javdb_403_count >= 10:
+                                print(f"[ImageFinder] JAVDB 403 차단 감지: 10번 연속 403 응답으로 인해 JAVDB 비활성화")
+                                self.javdb_available = False
+                                self.javdb_fail_count = 999  # 차단 상태 유지
+                                return []  # 10번 연속이면 차단
+                            # 10번 미만이면 403 카운트만 증가하고 반환 (javdb_fail_count는 증가하지 않음)
+                            return []
                     
                     if r.status_code == 200 and len(r.text) > 1000:
                         html = r.text
                         base_url = base
                         search_url = url
-                        # 연결 성공 시 활성화 상태 복구
+                        # 연결 성공 시 활성화 상태 복구 및 403 카운트 리셋
                         if not self.javdb_available:
                             self.javdb_available = True
                             self.javdb_fail_count = 0
                             print(f"[ImageFinder] JAVDB 재활성화: 연결 성공으로 인해 활성화 상태로 복구")
-                        print(f"[ImageFinder] JAVDB 연결 성공: {base} (코드: {code})")
+                        self.javdb_403_count = 0  # 성공 시 403 카운트 리셋
                         break
                     else:
                         print(f"[ImageFinder] JAVDB 응답 실패: {base}, status={r.status_code}, len={len(r.text)}")
@@ -1002,11 +1051,15 @@ class ImageFinder:
                     continue
             
             if not html:
-                # 모든 미러 실패 시 실패 카운트 증가
-                self.javdb_fail_count += 1
-                if self.javdb_fail_count >= 3 and self.javdb_available:
-                    self.javdb_available = False
-                    print("[ImageFinder] JAVDB 연결 불가 감지: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
+                # 403이 아닌 다른 오류만 실패 카운트 증가
+                # (403은 javdb_403_count로 별도 처리되므로 여기서는 증가하지 않음)
+                # 403이 발생한 경우는 이미 위에서 continue로 넘어갔으므로 여기 도달하지 않음
+                # 하지만 혹시 모를 경우를 대비해 403 카운트가 증가하지 않은 경우만 실패 카운트 증가
+                if self.javdb_403_count == 0:  # 403이 아닌 다른 오류인 경우만
+                    self.javdb_fail_count += 1
+                    if self.javdb_fail_count >= 3 and self.javdb_available:
+                        self.javdb_available = False
+                        print("[ImageFinder] JAVDB 연결 불가 감지: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
                 return []
             
             soup = BeautifulSoup(html, 'lxml')
@@ -1028,19 +1081,7 @@ class ImageFinder:
             
             anchor, title_text = find_first_card_and_title(soup)
             if not anchor:
-                print(f"[ImageFinder] JAVDB 카드 없음 (코드: {code}, HTML 길이: {len(html)})")
-                # 디버그: HTML 일부 출력
-                if len(html) > 0:
-                    soup_debug = BeautifulSoup(html, 'lxml')
-                    anchors_debug = soup_debug.select('a[href^="/v/"]')
-                    print(f"[ImageFinder] JAVDB 디버그: a[href^='/v/'] 앵커 {len(anchors_debug)}개 발견")
-                    if len(anchors_debug) > 0:
-                        first_anchor = anchors_debug[0]
-                        has_visual = bool(first_anchor.select_one("img, .cover, .video-cover, .image"))
-                        print(f"[ImageFinder] JAVDB 디버그: 첫 번째 앵커에 이미지 요소 있음: {has_visual}")
                 return []
-            
-            print(f"[ImageFinder] JAVDB 카드 발견 (코드: {code}, 카드제목: {title_text[:100] if title_text else 'None'}...)")
             
             # 제목 매칭 검증 (키워드 엄격 매칭)
             def compile_keyword_strict(keyword):
@@ -1056,12 +1097,7 @@ class ImageFinder:
             kw_re = compile_keyword_strict(code)
             match_result = kw_re.search(title_text) if title_text else None
             if not title_text or not match_result:
-                print(f"[ImageFinder] JAVDB 제목 불일치 (코드: {code}, 카드제목: {title_text[:100] if title_text else 'None'})")
-                if title_text:
-                    print(f"[ImageFinder] JAVDB 매칭 패턴: {kw_re.pattern}")
                 return []  # 제목 불일치
-            
-            print(f"[ImageFinder] JAVDB 제목 매칭 성공 (코드: {code})")
             
             # 카드 이미지 수집
             def _extract_bg_url(style_str):
@@ -1107,14 +1143,15 @@ class ImageFinder:
                 return uniq
             
             url_items = collect_card_images(anchor, base_url or "https://javdb.com")
-            print(f"[ImageFinder] JAVDB 이미지 후보 {len(url_items)}개 발견 (코드: {code})")
             
             # URL 추출 (첫 번째 이미지만 반환)
             for item in url_items[:1]:  # 첫 번째 이미지만 사용
                 url = item["url"]
                 if url and url.startswith('http'):
                     image_urls.append(url)
-                    print(f"[ImageFinder] JAVDB 이미지 URL 선택: {url[:80]}...")
+            
+            # HTTP 200 응답을 받았으므로 403 카운트 리셋 (이미지를 찾았든 못 찾았든)
+            self.javdb_403_count = 0  # 제대로 응답을 받았으므로 403 카운트 초기화
             
             # 요청 성공이므로 실패 카운터 리셋 및 활성화 상태 복구
             if image_urls:
@@ -1122,10 +1159,8 @@ class ImageFinder:
                 if not self.javdb_available:
                     self.javdb_available = True
                     print(f"[ImageFinder] JAVDB 재활성화: 이미지 발견으로 인해 활성화 상태로 복구")
-                print(f"[ImageFinder] JAVDB에서 이미지 발견: {code}")
                 return image_urls
             
-            print(f"[ImageFinder] JAVDB 이미지 URL 없음 (코드: {code}, 후보 수: {len(url_items)})")
             return []
             
         except (ConnectionError, Timeout) as e:
@@ -1983,7 +2018,6 @@ class ImageFinder:
             
             # 첫 번째 카드만 사용 (test.py 로직)
             anchor = anchors[0]
-            print(f"[ImageFinder] JAVBee 'Show Screenshot' 앵커 {len(anchors)}개 발견, 첫 번째 카드 사용 (제목: {display_title})")
             
             # 카드 제목 추출 & 키워드 엄격 매칭
             title_text = find_card_title_text(anchor)
@@ -2101,10 +2135,7 @@ class ImageFinder:
                 title_ok = bool(kw_re.search(title_text))
             
             if not title_ok:
-                print(f"[ImageFinder] JAVBee 카드 제목 불일치 - 이미지 없음으로 처리 (제목: {display_title}, 카드제목: {title_text}, 추출코드: {card_code}, 검색코드: {search_code})")
                 return []  # 제목이 키워드와 일치하지 않으면 즉시 반환
-            
-            print(f"[ImageFinder] JAVBee 카드 제목 매칭 성공 (제목: {display_title}, 카드제목: {title_text})")
             
             # 카드의 좌측 이미지 영역에서 후보 수집
             all_img_tags = []
@@ -2160,22 +2191,12 @@ class ImageFinder:
                     # javbee.image-sky.com/wp-content/uploads/ 경로는 최우선
                     if 'javbee.image-sky.com' in u.lower() and 'wp-content/uploads/' in u.lower():
                         image_urls.insert(0, u)
-                        print(f"[ImageFinder] JAVBee에서 이미지 발견 (Show Screenshot, javbee.image-sky.com) - 제목: {display_title}")
-                        print(f"  URL: {u}")
                     else:
                         image_urls.append(u)
-                        print(f"[ImageFinder] JAVBee에서 이미지 발견 (Show Screenshot) - 제목: {display_title}")
-                        print(f"  URL: {u}")
                     if len(image_urls) >= 3:
                         break
             
             # test.py 로직: 상세 페이지 방문하지 않음, 검색 결과 페이지에서만 찾음
-            
-            if image_urls:
-                print(f"[ImageFinder] JAVBee 검색 성공: {len(image_urls)}개 이미지 발견 (제목: {display_title})")
-            else:
-                print(f"[ImageFinder] JAVBee 검색 결과 없음: {search_query} (제목: {display_title})")
-            
             return image_urls[:3]
             
         except Exception as e:

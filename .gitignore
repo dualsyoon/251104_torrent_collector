@@ -42,6 +42,12 @@ venv.bak/
 *.sqlite
 *.sqlite3
 
+#profile
+chrome_profile/
+
+#debug
+test_images/
+
 # OS
 .DS_Store
 Thumbs.db
