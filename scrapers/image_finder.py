@@ -40,6 +40,9 @@ class ImageFinder:
         self.enable_javdb = qs.value('images/enable_javdb_fallback', ENABLE_JAVDB_FALLBACK, type=bool)
         self.javdb_available = self.enable_javdb
         self.javdb_fail_count = 0
+        
+        # JAVLibrary HTTP 차단 감지 플래그
+        self.javlibrary_blocked = False  # HTTP 403이 발생하면 True로 설정
         self.http_timeout = max(3, int(qs.value('images/image_http_timeout', IMAGE_HTTP_TIMEOUT)))
         self.http_retries = max(0, int(qs.value('images/image_http_retries', IMAGE_HTTP_RETRIES)))
         # 공통 플레이스홀더/썸네일 차단 리스트
@@ -588,8 +591,114 @@ class ImageFinder:
     
     def _search_javlibrary(self, code: str) -> List[str]:
         """JAVLibrary.com에서 이미지 검색"""
+        # HTTP 차단되었으면 바로 Selenium 사용
+        if self.javlibrary_blocked:
+            if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                return self._search_javlibrary_selenium(code)
+            return []
+        
+        image_urls = []
+        
+        # 방법 1: 직접 작품 페이지 URL 시도 (영어/일본어 버전)
+        for lang in ['en', 'ja']:
+            try:
+                direct_url = f"https://www.javlibrary.com/{lang}/?v={quote(code)}"
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+                    'Referer': f'https://www.javlibrary.com/{lang}/'
+                }
+                
+                response = self._safe_get(direct_url, headers=headers, timeout=self.http_timeout)
+                # HTTP 403이면 차단 플래그 설정하고 Selenium으로 전환
+                if response.status_code == 403:
+                    if not self.javlibrary_blocked:
+                        self.javlibrary_blocked = True
+                        print(f"[ImageFinder] JAVLibrary HTTP 403 감지, 이후 모든 요청은 Selenium 사용")
+                    if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                        selenium_urls = self._search_javlibrary_selenium(code)
+                        if selenium_urls:
+                            return selenium_urls
+                    # 차단되었으므로 나머지 HTTP 요청도 시도하지 않음
+                    break  # 루프 종료하고 Selenium으로 전환
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.content, 'lxml')
+                    
+                    # 썸네일 이미지 찾기 (여러 방법 시도)
+                    cover_img = soup.find('img', id='video_jacket_img')
+                    if not cover_img:
+                        cover_img = soup.find('img', {'id': 'video_jacket'})
+                    if not cover_img:
+                        cover_img = soup.find('img', class_='cover')
+                    if not cover_img:
+                        # img 태그 중 src에 'cover' 또는 'jacket'가 포함된 것 찾기
+                        for img in soup.find_all('img'):
+                            img_src = img.get('src', '') or img.get('data-src', '')
+                            if img_src and ('cover' in img_src.lower() or 'jacket' in img_src.lower()):
+                                cover_img = img
+                                break
+                    
+                    # DMM 이미지 URL도 찾기 (페이지 내 링크나 이미지에서)
+                    dmm_url = None
+                    page_text = str(soup)
+                    # DMM 이미지 URL 패턴 찾기: pics.dmm.co.jp/mono/movie/adult/{code}/
+                    code_clean = code.replace('-', '').replace('_', '').lower()
+                    dmm_patterns = [
+                        f'pics.dmm.co.jp/mono/movie/adult/{code_clean}/{code_clean}pl.jpg',
+                        f'pics.dmm.co.jp/mono/movie/adult/{code_clean}/{code_clean}ps.jpg',
+                        f'pics.dmm.co.jp/digital/video/{code_clean}/{code_clean}pl.jpg',
+                    ]
+                    for pattern in dmm_patterns:
+                        if pattern in page_text:
+                            # URL 추출
+                            import re
+                            dmm_match = re.search(r'https?://[^"\s<>]+' + re.escape(pattern.replace(code_clean, r'[^"\s<>]+')), page_text)
+                            if dmm_match:
+                                dmm_url = dmm_match.group(0)
+                                break
+                            else:
+                                # 패턴으로 직접 URL 생성
+                                dmm_url = f'https://{pattern}'
+                                break
+                    
+                    if cover_img:
+                        img_src = cover_img.get('src', '') or cover_img.get('data-src', '') or cover_img.get('data-lazy-src', '')
+                        if img_src:
+                            # 상대 URL 처리
+                            if not img_src.startswith('http'):
+                                if img_src.startswith('//'):
+                                    img_src = 'https:' + img_src
+                                elif img_src.startswith('/'):
+                                    img_src = f'https://www.javlibrary.com{img_src}'
+                                else:
+                                    img_src = urljoin(f'https://www.javlibrary.com/{lang}/', img_src)
+                            if img_src.startswith('http'):
+                                image_urls.append(img_src)
+                    
+                    # DMM URL이 있으면 추가 (우선순위 높음)
+                    if dmm_url:
+                        image_urls.insert(0, dmm_url)  # 맨 앞에 추가
+                        print(f"[ImageFinder] JAVLibrary에서 DMM 이미지 발견: {code} -> {dmm_url}")
+                    
+                    if image_urls:
+                        print(f"[ImageFinder] JAVLibrary에서 이미지 발견 (직접 URL, {lang}): {code}")
+                        return image_urls  # 찾았으면 바로 반환
+            except Exception as e:
+                # 직접 URL 실패는 조용히 넘어감 (다음 방법 시도)
+                pass
+        
+        # 방법 2: 검색 페이지를 통한 검색 (기존 방법)
+        # 차단 플래그 확인 (이미 차단되었으면 HTTP 요청 시도 안 함)
+        if self.javlibrary_blocked:
+            if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                selenium_urls = self._search_javlibrary_selenium(code)
+                if selenium_urls:
+                    return selenium_urls
+            return image_urls
+        
         try:
-            # JAVLibrary 검색 URL (일본어 버전)
+            # 일본어 버전 검색
             search_url = f"https://www.javlibrary.com/ja/vl_searchbyid.php?keyword={quote(code)}"
             
             headers = {
@@ -601,10 +710,21 @@ class ImageFinder:
             
             response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
             if response.status_code != 200:
-                return []
+                # HTTP 403 (Forbidden) 오류면 차단 플래그 설정하고 Selenium으로 시도
+                if response.status_code == 403:
+                    if not self.javlibrary_blocked:
+                        self.javlibrary_blocked = True
+                        print(f"[ImageFinder] JAVLibrary HTTP 403 감지, 이후 모든 요청은 Selenium 사용")
+                    if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                        selenium_urls = self._search_javlibrary_selenium(code)
+                        if selenium_urls:
+                            return selenium_urls
+                    return image_urls  # 403이면 조용히 반환 (이미 메시지 출력됨)
+                # 403이 아닌 다른 오류만 로그 출력
+                print(f"[ImageFinder] JAVLibrary 검색 페이지 HTTP {response.status_code}: {code}")
+                return image_urls
             
             soup = BeautifulSoup(response.content, 'lxml')
-            image_urls = []
             
             # 작품 페이지 링크 찾기 (여러 방법 시도)
             video_link = soup.find('a', class_='video')
@@ -614,48 +734,109 @@ class ImageFinder:
                 if video_div:
                     video_link = video_div.find('a')
             
-            if video_link:
-                href = video_link.get('href', '')
-                if href:
-                    # 상대 URL 처리
-                    if href.startswith('/'):
-                        video_url = f"https://www.javlibrary.com{href}"
-                    elif href.startswith('http'):
-                        video_url = href
+            if not video_link:
+                print(f"[ImageFinder] JAVLibrary 검색 결과에서 작품 링크를 찾지 못함: {code}")
+                return image_urls
+            
+            href = video_link.get('href', '')
+            if not href:
+                print(f"[ImageFinder] JAVLibrary 작품 링크에 href가 없음: {code}")
+                return image_urls
+            
+            # 상대 URL 처리
+            if href.startswith('/'):
+                video_url = f"https://www.javlibrary.com{href}"
+            elif href.startswith('http'):
+                video_url = href
+            else:
+                video_url = urljoin('https://www.javlibrary.com/ja/', href)
+            
+            # 상세 페이지에서 이미지 가져오기
+            detail_response = self._safe_get(video_url, headers=headers, timeout=self.http_timeout)
+            if detail_response.status_code != 200:
+                # HTTP 403이면 차단 플래그 설정하고 Selenium으로 전환
+                if detail_response.status_code == 403:
+                    if not self.javlibrary_blocked:
+                        self.javlibrary_blocked = True
+                        print(f"[ImageFinder] JAVLibrary HTTP 403 감지, 이후 모든 요청은 Selenium 사용")
+                    if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
+                        selenium_urls = self._search_javlibrary_selenium(code)
+                        if selenium_urls:
+                            return selenium_urls
+                    return image_urls  # 403이면 조용히 반환 (이미 메시지 출력됨)
+                # 403이 아닌 다른 오류만 로그 출력
+                print(f"[ImageFinder] JAVLibrary 상세 페이지 HTTP {detail_response.status_code}: {code}")
+                return image_urls
+            
+            detail_soup = BeautifulSoup(detail_response.content, 'lxml')
+            
+            # DMM 이미지 URL도 찾기 (페이지 내 링크나 이미지에서)
+            dmm_url = None
+            page_text = str(detail_soup)
+            # DMM 이미지 URL 패턴 찾기: pics.dmm.co.jp/mono/movie/adult/{code}/
+            code_clean = code.replace('-', '').replace('_', '').lower()
+            dmm_patterns = [
+                f'pics.dmm.co.jp/mono/movie/adult/{code_clean}/{code_clean}pl.jpg',
+                f'pics.dmm.co.jp/mono/movie/adult/{code_clean}/{code_clean}ps.jpg',
+                f'pics.dmm.co.jp/digital/video/{code_clean}/{code_clean}pl.jpg',
+            ]
+            for pattern in dmm_patterns:
+                if pattern in page_text:
+                    # URL 추출
+                    import re
+                    dmm_match = re.search(r'https?://[^"\s<>]+' + re.escape(pattern.replace(code_clean, r'[^"\s<>]+')), page_text)
+                    if dmm_match:
+                        dmm_url = dmm_match.group(0)
+                        break
                     else:
-                        video_url = urljoin('https://www.javlibrary.com/ja/', href)
-                    
-                    # 상세 페이지에서 이미지 가져오기
-                    detail_response = self._safe_get(video_url, headers=headers, timeout=self.http_timeout)
-                    if detail_response.status_code == 200:
-                        detail_soup = BeautifulSoup(detail_response.content, 'lxml')
-                        
-                        # 썸네일 이미지 (여러 방법 시도)
-                        cover_img = detail_soup.find('img', id='video_jacket_img')
-                        if not cover_img:
-                            cover_img = detail_soup.find('img', {'id': 'video_jacket'})
-                        if not cover_img:
-                            # poster 이미지 찾기
-                            cover_img = detail_soup.find('img', class_='cover')
-                        
-                        if cover_img:
-                            img_src = cover_img.get('src', '') or cover_img.get('data-src', '')
-                            if img_src:
-                                # 상대 URL 처리
-                                if not img_src.startswith('http'):
-                                    if img_src.startswith('//'):
-                                        img_src = 'https:' + img_src
-                                    elif img_src.startswith('/'):
-                                        img_src = 'https://www.javlibrary.com' + img_src
-                                    else:
-                                        img_src = urljoin('https://www.javlibrary.com/ja/', img_src)
-                                image_urls.append(img_src)
-                                print(f"[ImageFinder] JAVLibrary에서 이미지 발견: {code}")
+                        # 패턴으로 직접 URL 생성
+                        dmm_url = f'https://{pattern}'
+                        break
+            
+            # 썸네일 이미지 (여러 방법 시도)
+            cover_img = detail_soup.find('img', id='video_jacket_img')
+            if not cover_img:
+                cover_img = detail_soup.find('img', {'id': 'video_jacket'})
+            if not cover_img:
+                cover_img = detail_soup.find('img', class_='cover')
+            if not cover_img:
+                # img 태그 중 src에 'cover' 또는 'jacket'가 포함된 것 찾기
+                for img in detail_soup.find_all('img'):
+                    img_src = img.get('src', '') or img.get('data-src', '')
+                    if img_src and ('cover' in img_src.lower() or 'jacket' in img_src.lower()):
+                        cover_img = img
+                        break
+            
+            if cover_img:
+                img_src = cover_img.get('src', '') or cover_img.get('data-src', '') or cover_img.get('data-lazy-src', '')
+                if img_src:
+                    # 상대 URL 처리
+                    if not img_src.startswith('http'):
+                        if img_src.startswith('//'):
+                            img_src = 'https:' + img_src
+                        elif img_src.startswith('/'):
+                            img_src = 'https://www.javlibrary.com' + img_src
+                        else:
+                            img_src = urljoin('https://www.javlibrary.com/ja/', img_src)
+                    if img_src.startswith('http'):
+                        image_urls.append(img_src)
+            
+            # DMM URL이 있으면 추가 (우선순위 높음)
+            if dmm_url:
+                image_urls.insert(0, dmm_url)  # 맨 앞에 추가
+                print(f"[ImageFinder] JAVLibrary에서 DMM 이미지 발견: {code} -> {dmm_url}")
+            
+            if image_urls:
+                print(f"[ImageFinder] JAVLibrary에서 이미지 발견 (검색): {code}")
+            else:
+                print(f"[ImageFinder] JAVLibrary 상세 페이지에서 이미지를 찾지 못함: {code}")
             
             return image_urls
             
         except Exception as e:
             print(f"[ImageFinder] JAVLibrary 검색 오류 ({code}): {e}")
+            import traceback
+            print(f"[ImageFinder] JAVLibrary 검색 오류 상세: {traceback.format_exc()}")
             return []
     
     def _search_javdb(self, code: str) -> List[str]:
@@ -924,6 +1105,259 @@ class ImageFinder:
                 except:
                     pass
                 self.selenium_driver = None
+            return []
+    
+    def _search_javlibrary_selenium(self, code: str) -> List[str]:
+        """Selenium을 이용한 JAVLibrary 검색 (HTTP 403 우회)"""
+        if not (SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES):
+            return []
+        try:
+            driver = self._get_selenium_driver()
+            self.selenium_use_count += 1
+            
+            image_urls = []
+            
+            # 방법 1: 직접 작품 페이지 URL 시도 (영어/일본어/중국어 버전)
+            for lang in ['en', 'ja', 'cn']:
+                try:
+                    direct_url = f"https://www.javlibrary.com/{lang}/?v={quote(code)}"
+                    driver.get(direct_url)
+                    
+                    # 페이지 로딩 대기 (더 긴 대기 시간)
+                    try:
+                        WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "img"))
+                        )
+                    except:
+                        time.sleep(1.0)  # 대기 시간 증가
+                    
+                    # URL이 리다이렉트되었는지 확인
+                    current_url = driver.current_url
+                    if 'vl_searchbyid' in current_url or 'search' in current_url:
+                        # 검색 결과 페이지로 리다이렉트된 경우
+                        page_source = driver.page_source
+                        soup = BeautifulSoup(page_source, 'lxml')
+                        
+                        # 검색 결과에서 작품 링크 찾기 (여러 방법 시도)
+                        video_link = None
+                        # 방법 1: class='video'인 a 태그
+                        video_link = soup.find('a', class_='video')
+                        # 방법 2: div.video 내부의 a 태그
+                        if not video_link:
+                            video_div = soup.find('div', class_='video')
+                            if video_div:
+                                video_link = video_div.find('a')
+                        # 방법 3: href에 code가 포함된 링크
+                        if not video_link:
+                            for a in soup.find_all('a', href=True):
+                                href = a.get('href', '')
+                                if code.upper() in href.upper() or code.lower() in href.lower():
+                                    video_link = a
+                                    break
+                        
+                        if video_link:
+                            href = video_link.get('href', '')
+                            if href:
+                                # 상대 URL 처리
+                                if href.startswith('/'):
+                                    video_url = f"https://www.javlibrary.com{href}"
+                                elif href.startswith('http'):
+                                    video_url = href
+                                else:
+                                    video_url = urljoin(f'https://www.javlibrary.com/{lang}/', href)
+                                
+                                # 상세 페이지로 이동
+                                driver.get(video_url)
+                                time.sleep(1.0)
+                                current_url = driver.current_url
+                    
+                    page_source = driver.page_source
+                    soup = BeautifulSoup(page_source, 'lxml')
+                    
+                    # 썸네일 이미지 찾기 (더 많은 방법 시도)
+                    cover_img = None
+                    # 방법 1: id='video_jacket_img'
+                    cover_img = soup.find('img', id='video_jacket_img')
+                    # 방법 2: id='video_jacket'
+                    if not cover_img:
+                        cover_img = soup.find('img', {'id': 'video_jacket'})
+                    # 방법 3: class='cover'
+                    if not cover_img:
+                        cover_img = soup.find('img', class_='cover')
+                    # 방법 4: img 태그 중 src에 'cover' 또는 'jacket'가 포함된 것
+                    if not cover_img:
+                        for img in soup.find_all('img'):
+                            img_src = img.get('src', '') or img.get('data-src', '') or img.get('data-lazy-src', '')
+                            if img_src and ('cover' in img_src.lower() or 'jacket' in img_src.lower() or 'poster' in img_src.lower()):
+                                cover_img = img
+                                break
+                    # 방법 5: 가장 큰 이미지 (일반적으로 커버 이미지)
+                    if not cover_img:
+                        imgs = soup.find_all('img')
+                        if imgs:
+                            # src에 'javlibrary'가 포함된 이미지 우선
+                            for img in imgs:
+                                img_src = img.get('src', '') or img.get('data-src', '')
+                                if img_src and 'javlibrary' in img_src.lower():
+                                    cover_img = img
+                                    break
+                            # 없으면 첫 번째 이미지
+                            if not cover_img and imgs:
+                                cover_img = imgs[0]
+                    
+                    if cover_img:
+                        img_src = cover_img.get('src', '') or cover_img.get('data-src', '') or cover_img.get('data-lazy-src', '') or cover_img.get('data-original', '')
+                        if img_src:
+                            # 상대 URL 처리
+                            if not img_src.startswith('http'):
+                                if img_src.startswith('//'):
+                                    img_src = 'https:' + img_src
+                                elif img_src.startswith('/'):
+                                    img_src = f'https://www.javlibrary.com{img_src}'
+                                else:
+                                    img_src = urljoin(f'https://www.javlibrary.com/{lang}/', img_src)
+                            if img_src.startswith('http') and 'javlibrary' in img_src.lower():
+                                image_urls.append(img_src)
+                                print(f"[ImageFinder] JAVLibrary에서 이미지 발견 (Selenium, 직접 URL, {lang}): {code}")
+                                return image_urls  # 찾았으면 바로 반환
+                except Exception as e:
+                    # 직접 URL 실패는 조용히 넘어감 (다음 방법 시도)
+                    pass
+            
+            # 방법 2: 검색 페이지를 통한 검색 (여러 언어 버전)
+            for lang in ['ja', 'en', 'cn']:
+                try:
+                    search_url = f"https://www.javlibrary.com/{lang}/vl_searchbyid.php?keyword={quote(code)}"
+                    driver.get(search_url)
+                    
+                    # 페이지 로딩 대기
+                    try:
+                        WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "a"))
+                        )
+                    except:
+                        time.sleep(1.0)
+                    
+                    page_source = driver.page_source
+                    soup = BeautifulSoup(page_source, 'lxml')
+                    
+                    # 작품 페이지 링크 찾기 (더 많은 방법 시도)
+                    video_link = None
+                    # 방법 1: class='video'인 a 태그
+                    video_link = soup.find('a', class_='video')
+                    # 방법 2: div.video 내부의 a 태그
+                    if not video_link:
+                        video_div = soup.find('div', class_='video')
+                        if video_div:
+                            video_link = video_div.find('a')
+                    # 방법 3: href에 code가 포함된 링크
+                    if not video_link:
+                        for a in soup.find_all('a', href=True):
+                            href = a.get('href', '')
+                            if code.upper() in href.upper() or code.lower() in href.lower():
+                                video_link = a
+                                break
+                    # 방법 4: title에 code가 포함된 링크
+                    if not video_link:
+                        for a in soup.find_all('a', title=True):
+                            title = a.get('title', '')
+                            if code.upper() in title.upper() or code.lower() in title.lower():
+                                video_link = a
+                                break
+                    
+                    if video_link:
+                        href = video_link.get('href', '')
+                        if href:
+                            # 상대 URL 처리
+                            if href.startswith('/'):
+                                video_url = f"https://www.javlibrary.com{href}"
+                            elif href.startswith('http'):
+                                video_url = href
+                            else:
+                                video_url = urljoin(f'https://www.javlibrary.com/{lang}/', href)
+                            
+                            # 상세 페이지로 이동
+                            driver.get(video_url)
+                            time.sleep(1.0)
+                            
+                            detail_source = driver.page_source
+                            detail_soup = BeautifulSoup(detail_source, 'lxml')
+                            
+                            # DMM 이미지 URL도 찾기 (페이지 내 링크나 이미지에서)
+                            dmm_url = None
+                            page_text = str(detail_soup)
+                            # DMM 이미지 URL 패턴 찾기: pics.dmm.co.jp/mono/movie/adult/{code}/
+                            code_clean = code.replace('-', '').replace('_', '').lower()
+                            dmm_patterns = [
+                                f'pics.dmm.co.jp/mono/movie/adult/{code_clean}/{code_clean}pl.jpg',
+                                f'pics.dmm.co.jp/mono/movie/adult/{code_clean}/{code_clean}ps.jpg',
+                                f'pics.dmm.co.jp/digital/video/{code_clean}/{code_clean}pl.jpg',
+                            ]
+                            for pattern in dmm_patterns:
+                                if pattern in page_text:
+                                    # URL 추출
+                                    import re
+                                    dmm_match = re.search(r'https?://[^"\s<>]+' + re.escape(pattern.replace(code_clean, r'[^"\s<>]+')), page_text)
+                                    if dmm_match:
+                                        dmm_url = dmm_match.group(0)
+                                        break
+                                    else:
+                                        # 패턴으로 직접 URL 생성
+                                        dmm_url = f'https://{pattern}'
+                                        break
+                            
+                            # 썸네일 이미지 찾기 (더 많은 방법 시도)
+                            cover_img = None
+                            cover_img = detail_soup.find('img', id='video_jacket_img')
+                            if not cover_img:
+                                cover_img = detail_soup.find('img', {'id': 'video_jacket'})
+                            if not cover_img:
+                                cover_img = detail_soup.find('img', class_='cover')
+                            if not cover_img:
+                                for img in detail_soup.find_all('img'):
+                                    img_src = img.get('src', '') or img.get('data-src', '')
+                                    if img_src and ('cover' in img_src.lower() or 'jacket' in img_src.lower() or 'poster' in img_src.lower()):
+                                        cover_img = img
+                                        break
+                            if not cover_img:
+                                imgs = detail_soup.find_all('img')
+                                if imgs:
+                                    for img in imgs:
+                                        img_src = img.get('src', '') or img.get('data-src', '')
+                                        if img_src and 'javlibrary' in img_src.lower():
+                                            cover_img = img
+                                            break
+                            
+                            if cover_img:
+                                img_src = cover_img.get('src', '') or cover_img.get('data-src', '') or cover_img.get('data-lazy-src', '') or cover_img.get('data-original', '')
+                                if img_src:
+                                    # 상대 URL 처리
+                                    if not img_src.startswith('http'):
+                                        if img_src.startswith('//'):
+                                            img_src = 'https:' + img_src
+                                        elif img_src.startswith('/'):
+                                            img_src = 'https://www.javlibrary.com' + img_src
+                                        else:
+                                            img_src = urljoin(f'https://www.javlibrary.com/{lang}/', img_src)
+                                    if img_src.startswith('http'):
+                                        image_urls.append(img_src)
+                            
+                            # DMM URL이 있으면 추가 (우선순위 높음)
+                            if dmm_url:
+                                image_urls.insert(0, dmm_url)  # 맨 앞에 추가
+                                print(f"[ImageFinder] JAVLibrary에서 DMM 이미지 발견 (Selenium): {code} -> {dmm_url}")
+                            
+                            if image_urls:
+                                print(f"[ImageFinder] JAVLibrary에서 이미지 발견 (Selenium, 검색, {lang}): {code}")
+                                return image_urls  # 찾았으면 바로 반환
+                except Exception as e:
+                    pass
+            
+            return image_urls
+        except Exception as e:
+            print(f"[ImageFinder] JAVLibrary Selenium 검색 오류 ({code}): {e}")
+            import traceback
+            print(f"[ImageFinder] JAVLibrary Selenium 검색 오류 상세: {traceback.format_exc()}")
             return []
     
     def _search_javdb_selenium(self, code: str) -> List[str]:

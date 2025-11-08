@@ -59,20 +59,20 @@ class ThumbnailUpdateThread(QThread):
             
             # 병렬 처리 중이면 우선순위 큐에 직접 추가
             if hasattr(self, 'priority_queue') and hasattr(self, 'main_queue') and hasattr(self, 'server_queues'):
-                # 기존 우선순위 큐의 항목들을 일반 큐로 이동
-                moved_count = 0
+                # 기존 우선순위 큐의 항목들을 임시로 보관 (새 우선순위 항목 뒤에 다시 추가)
+                existing_priority_items = []
                 while not self.priority_queue.empty():
                     try:
                         item = self.priority_queue.get_nowait()
-                        # 우선순위 플래그 제거하고 일반 큐로 이동
-                        item['is_priority'] = False
-                        self.main_queue.put(item)
-                        moved_count += 1
+                        # 기존 우선순위 항목 중에서 새 우선순위에 포함되지 않은 것만 보관
+                        if item['id'] not in self.priority_ids:
+                            existing_priority_items.append(item)
+                        # 새 우선순위에 포함된 항목은 제거 (나중에 새로 추가됨)
                     except queue.Empty:
                         break
                 
-                if moved_count > 0:
-                    print(f"[썸네일] 기존 우선순위 항목 {moved_count}개를 일반 큐로 이동")
+                if existing_priority_items:
+                    print(f"[썸네일] 기존 우선순위 항목 {len(existing_priority_items)}개를 새 우선순위 뒤로 이동")
                 
                 # 현재 큐에 있는 항목 ID 확인 (중복 방지)
                 existing_ids = set()
@@ -200,27 +200,23 @@ class ThumbnailUpdateThread(QThread):
                 all_priority_items_sorted = sorted(all_priority_items, key=priority_sort_key)
                 
                 # 우선순위 큐에 추가 (중복 제거)
+                # 페이지 변경 시에는 항상 맨 앞에 추가 (빠르게 처리)
                 added_ids = set()
-                for item in all_priority_items_sorted:
-                    if item['id'] not in added_ids:
-                        if force_first:
-                            # force_first인 경우 (썸네일 교체 버튼) 맨 앞에 추가하려면
-                            # 임시로 모든 항목을 빼서 다시 넣어야 함
-                            temp_queue = queue.Queue()
-                            while not self.priority_queue.empty():
-                                try:
-                                    temp_queue.put(self.priority_queue.get_nowait())
-                                except queue.Empty:
-                                    break
+                if all_priority_items_sorted:
+                    # 새 우선순위 항목들을 맨 앞에 추가 (priority_ids 순서대로)
+                    print(f"[썸네일] 새 우선순위 항목 {len(all_priority_items_sorted)}개를 우선순위 큐 맨 앞에 추가")
+                    for item in all_priority_items_sorted:
+                        if item['id'] not in added_ids:
                             self.priority_queue.put(item)
-                            while not temp_queue.empty():
-                                try:
-                                    self.priority_queue.put(temp_queue.get_nowait())
-                                except queue.Empty:
-                                    break
-                        else:
-                            self.priority_queue.put(item)
-                        added_ids.add(item['id'])
+                            added_ids.add(item['id'])
+                    
+                    # 기존 우선순위 항목들을 뒤에 추가 (새 우선순위 항목이 먼저 처리되도록)
+                    if existing_priority_items:
+                        print(f"[썸네일] 기존 우선순위 항목 {len(existing_priority_items)}개를 새 우선순위 뒤에 추가")
+                        for existing_item in existing_priority_items:
+                            if existing_item['id'] not in added_ids:
+                                self.priority_queue.put(existing_item)
+                                added_ids.add(existing_item['id'])
                 
                 if all_priority_items_sorted:
                     moved_count = len(priority_items_from_queue)
@@ -354,7 +350,6 @@ class ThumbnailUpdateThread(QThread):
                     'missav': queue.Queue(),
                     'javlibrary': queue.Queue(),
                     'javdb': queue.Queue(),
-                    'javmost': queue.Queue(),
                     'fc2ppv': queue.Queue()  # FC2 재시도 큐
                 }
                 
@@ -428,11 +423,21 @@ class ThumbnailUpdateThread(QThread):
                                     if image_urls:
                                         break
                         elif server == 'javlibrary':
-                            for code in codes:
-                                urls = finder._search_javdatabase(code)
-                                image_urls.extend(urls)
-                                if image_urls:
-                                    break
+                            from config import ENABLE_SELENIUM_FOR_IMAGES
+                            if ENABLE_SELENIUM_FOR_IMAGES:
+                                # Selenium 우선 시도 (HTTP 403 우회)
+                                for code in codes:
+                                    urls = finder._search_javlibrary_selenium(code)
+                                    image_urls.extend(urls)
+                                    if image_urls:
+                                        break
+                            # Selenium 실패 시 일반 HTTP 시도
+                            if not image_urls:
+                                for code in codes:
+                                    urls = finder._search_javdatabase(code)
+                                    image_urls.extend(urls)
+                                    if image_urls:
+                                        break
                         elif server == 'javdb':
                             from config import ENABLE_SELENIUM_FOR_IMAGES
                             if ENABLE_SELENIUM_FOR_IMAGES:
@@ -447,12 +452,6 @@ class ThumbnailUpdateThread(QThread):
                                     image_urls.extend(urls)
                                     if image_urls:
                                         break
-                        elif server == 'javmost':
-                            for code in codes:
-                                urls = finder._search_javmost(code)
-                                image_urls.extend(urls)
-                                if image_urls:
-                                    break
                     
                     # FC2PPV.stream 검색 (백업용, FC2 공식 사이트에서 못 찾은 경우)
                     if is_fc2_title and fc2_codes and server == 'fc2ppv' and not image_urls:
@@ -470,8 +469,13 @@ class ThumbnailUpdateThread(QThread):
                                 urls = finder._search_missav_selenium(title)
                                 image_urls.extend(urls)
                         elif server == 'javlibrary':
-                            urls = finder._search_javdatabase(title)
-                            image_urls.extend(urls)
+                            from config import ENABLE_SELENIUM_FOR_IMAGES
+                            if ENABLE_SELENIUM_FOR_IMAGES:
+                                urls = finder._search_javlibrary_selenium(title)
+                                image_urls.extend(urls)
+                            if not image_urls:
+                                urls = finder._search_javdatabase(title)
+                                image_urls.extend(urls)
                         elif server == 'javdb':
                             from config import ENABLE_SELENIUM_FOR_IMAGES
                             if ENABLE_SELENIUM_FOR_IMAGES:
@@ -480,9 +484,6 @@ class ThumbnailUpdateThread(QThread):
                             else:
                                 urls = finder._search_javdb(title)
                                 image_urls.extend(urls)
-                        elif server == 'javmost':
-                            urls = finder._search_javmost(title)
-                            image_urls.extend(urls)
                         # FC2는 작품번호로만 검색 (전체 제목 검색 안 함)
                     
                     # 필터링
@@ -510,6 +511,19 @@ class ThumbnailUpdateThread(QThread):
                 def server_worker(priority_q: queue.Queue, server_name: str, source_queues: list, other_queues: list):
                     """서버별 워커 스레드 (각 서버당 1개씩만 실행, 병렬 처리)"""
                     nonlocal updated_count  # 외부 스코프의 updated_count에 접근
+                    import time
+                    thread_id = threading.current_thread().ident
+                    print(f"[{server_name.upper()}] 워커 스레드 시작됨 (Thread ID: {thread_id})")
+                    
+                    # 스레드별 처리 통계
+                    processed_count = 0  # 처리한 항목 수
+                    found_count = 0  # 찾은 항목 수
+                    last_status_time = time.time()
+                    
+                    # 서버 차단 감지용 변수
+                    consecutive_no_found = 0  # 연속으로 찾지 못한 횟수
+                    server_blocked = False  # 서버가 차단되었는지 여부
+                    BLOCK_THRESHOLD = 20  # 20개 처리했는데 발견이 0개면 차단으로 판단
                     
                     # FC2 패턴
                     fc2_patterns = [
@@ -586,8 +600,12 @@ class ThumbnailUpdateThread(QThread):
                             
                             if item is None:
                                 # FC2 항목을 찾지 못했으면 잠시 대기 후 재시도
-                                import time
                                 time.sleep(0.1)
+                                # 주기적으로 상태 출력 (10초마다)
+                                current_time = time.time()
+                                if current_time - last_status_time >= 10.0:
+                                    print(f"[{server_name.upper()}] 스레드 대기 중: 처리 {processed_count}개, 발견 {found_count}개 (Thread ID: {thread_id})")
+                                    last_status_time = current_time
                                 continue
                         else:
                             # 다른 서버는 우선순위 큐와 main_queue 확인
@@ -595,6 +613,15 @@ class ThumbnailUpdateThread(QThread):
                             try:
                                 item = priority_q.get_nowait()  # non-blocking으로 즉시 확인
                                 used_queue = priority_q
+                                # 디버그: 우선순위 큐에서 항목을 가져왔을 때 로그 (처음 몇 개만)
+                                if not hasattr(server_worker, '_priority_debug_count'):
+                                    server_worker._priority_debug_count = {}
+                                if server_name not in server_worker._priority_debug_count:
+                                    server_worker._priority_debug_count[server_name] = 0
+                                if server_worker._priority_debug_count[server_name] < 3:
+                                    priority_mark = "[우선순위] " if item.get('is_priority', False) else ""
+                                    print(f"[{server_name.upper()}] {priority_mark}우선순위 큐에서 항목 가져옴: {item.get('title', '')[:50]}")
+                                    server_worker._priority_debug_count[server_name] += 1
                             except queue.Empty:
                                 # 우선순위 큐가 비어있으면 소스 큐들 확인
                                 for source_queue in source_queues:
@@ -615,6 +642,7 @@ class ThumbnailUpdateThread(QThread):
                             
                             if item is None:
                                 # 모든 큐가 비어있으면 종료
+                                print(f"[{server_name.upper()}] 스레드 종료: 총 처리 {processed_count}개, 발견 {found_count}개 (Thread ID: {thread_id})")
                                 break
                             
                             # 다른 서버는 FC2 항목을 만나면 스킵하고 다시 큐에 넣거나 다른 서버로 넘기기
@@ -627,23 +655,48 @@ class ThumbnailUpdateThread(QThread):
                                     pass
                                 continue
                             
-                            # 디버그: 다른 서버가 항목을 처리할 때 로그 출력 (처음 몇 개만)
-                            if not hasattr(server_worker, '_debug_count'):
-                                server_worker._debug_count = {}
-                            if server_name not in server_worker._debug_count:
-                                server_worker._debug_count[server_name] = 0
-                            if server_worker._debug_count[server_name] < 3:
-                                print(f"[{server_name.upper()}] 항목 처리 시작: {item.get('title', '')[:50]}")
-                                server_worker._debug_count[server_name] += 1
+                            # 디버그 로그 제거 (찾은 경우만 출력)
                         
                         if item is None:
                             # 모든 큐가 비어있으면 종료
+                            print(f"[{server_name.upper()}] 스레드 종료: 총 처리 {processed_count}개, 발견 {found_count}개 (Thread ID: {thread_id})")
                             break
                         
                         torrent_id = item['id']
                         title = item['title']
                         is_priority = item['is_priority']
                         exclude_hosts = item.get('exclude_hosts', [])
+                        
+                        # 처리 카운트 증가
+                        processed_count += 1
+                        
+                        # 서버 차단 감지: 일정 개수 이상 처리했는데 발견이 0개면 차단으로 판단
+                        if processed_count >= BLOCK_THRESHOLD and found_count == 0:
+                            if not server_blocked:
+                                server_blocked = True
+                                print(f"[{server_name.upper()}] ⚠️ 서버 차단 감지: 처리 {processed_count}개, 발견 0개 - 스레드 작업 정지 (Thread ID: {thread_id})")
+                        
+                        # 차단된 서버는 작업 정지
+                        if server_blocked:
+                            # 주기적으로 상태 출력 (10초마다)
+                            current_time = time.time()
+                            if current_time - last_status_time >= 10.0:
+                                print(f"[{server_name.upper()}] ⚠️ 서버 차단으로 인한 작업 정지 (처리 {processed_count}개, 발견 {found_count}개)")
+                                last_status_time = current_time
+                            time.sleep(1.0)  # 대기 후 재확인
+                            continue
+                        
+                        # 주기적으로 상태 출력 (10초마다)
+                        current_time = time.time()
+                        if current_time - last_status_time >= 10.0:
+                            # 발견률 계산
+                            found_rate = (found_count / processed_count * 100) if processed_count > 0 else 0
+                            print(f"[{server_name.upper()}] 스레드 상태: 처리 {processed_count}개, 발견 {found_count}개 (발견률: {found_rate:.1f}%) (Thread ID: {thread_id})")
+                            last_status_time = current_time
+                            
+                            # 발견률이 너무 낮으면 경고 (처리 10개 이상, 발견률 5% 미만)
+                            if processed_count >= 10 and found_rate < 5.0:
+                                print(f"[{server_name.upper()}] ⚠️ 발견률이 낮습니다: {found_rate:.1f}% (처리 {processed_count}개, 발견 {found_count}개)")
                         
                         # 이미 다른 서버에서 찾았는지 확인
                         with status_lock:
@@ -684,18 +737,6 @@ class ThumbnailUpdateThread(QThread):
                                 # 현재 서버에서 검색
                                 thumbnail_url = search_server_specific(title, server_name, exclude_hosts)
                                 
-                                # 디버그: 검색 결과 확인 (처음 몇 개만)
-                                if not hasattr(server_worker, '_search_debug_count'):
-                                    server_worker._search_debug_count = {}
-                                if server_name not in server_worker._search_debug_count:
-                                    server_worker._search_debug_count[server_name] = 0
-                                if server_worker._search_debug_count[server_name] < 3:
-                                    if thumbnail_url:
-                                        print(f"[{server_name.upper()}] 검색 성공: {title[:50]}...")
-                                    else:
-                                        print(f"[{server_name.upper()}] 검색 실패: {title[:50]}...")
-                                    server_worker._search_debug_count[server_name] += 1
-                                
                                 # 다시 한번 확인 (다른 서버에서 이미 찾았을 수 있음)
                                 with status_lock:
                                     if torrent_id in torrent_status and torrent_status[torrent_id].get('found'):
@@ -704,6 +745,8 @@ class ThumbnailUpdateThread(QThread):
                                 
                                 if thumbnail_url:
                                     # 찾은 경우에만 출력
+                                    found_count += 1
+                                    consecutive_no_found = 0  # 연속 실패 카운트 리셋
                                     priority_mark = "[우선순위] " if is_priority else ""
                                     print(f"[{server_name.upper()}] {priority_mark}썸네일 발견: {title[:50]}... ({thumbnail_url[:60]}...)")
                                     
@@ -748,7 +791,7 @@ class ThumbnailUpdateThread(QThread):
                                                 torrent_status[torrent_id]['tried_servers'].add(server_name)
                                             
                                             tried_servers = torrent_status[torrent_id].get('tried_servers', set())
-                                            all_servers = {'missav', 'javlibrary', 'javdb', 'javmost', 'fc2ppv'}
+                                            all_servers = {'missav', 'javlibrary', 'javdb', 'fc2ppv'}
                                             remaining_servers = all_servers - tried_servers
                                             
                                             if remaining_servers:
@@ -764,16 +807,10 @@ class ThumbnailUpdateThread(QThread):
                                         
                                         used_queue.task_done()
                                 else:
-                                    # 현재 서버에서 못 찾음 - 다른 서버 큐로 넘기기
-                                    # 디버그: 못 찾았을 때 로그 출력 (처음 몇 개만)
-                                    if not hasattr(server_worker, '_not_found_count'):
-                                        server_worker._not_found_count = {}
-                                    if server_name not in server_worker._not_found_count:
-                                        server_worker._not_found_count[server_name] = 0
-                                    if server_worker._not_found_count[server_name] < 3:
-                                        print(f"[{server_name.upper()}] 썸네일 없음: {title[:50]}...")
-                                        server_worker._not_found_count[server_name] += 1
+                                    # 현재 서버에서 못 찾음
+                                    consecutive_no_found += 1
                                     
+                                    # 다른 서버 큐로 넘기기
                                     with status_lock:
                                         if torrent_id not in torrent_status:
                                             torrent_status[torrent_id] = {'found': False, 'tried_servers': {server_name}}
@@ -784,7 +821,7 @@ class ThumbnailUpdateThread(QThread):
                                         
                                         # 아직 시도하지 않은 다른 서버 큐에 추가
                                         # FC2 서버에서 못 찾았으면 다른 서버도 시도
-                                        all_servers = {'missav', 'javlibrary', 'javdb', 'javmost', 'fc2ppv'}
+                                        all_servers = {'missav', 'javlibrary', 'javdb', 'fc2ppv'}
                                         remaining_servers = all_servers - tried_servers
                                         
                                         if remaining_servers:
@@ -812,7 +849,7 @@ class ThumbnailUpdateThread(QThread):
                                     torrent_status[torrent_id]['tried_servers'].add(server_name)
                                 
                                 tried_servers = torrent_status[torrent_id].get('tried_servers', set())
-                                all_servers = {'missav', 'javlibrary', 'javdb', 'javmost', 'fc2ppv'}
+                                all_servers = {'missav', 'javlibrary', 'javdb', 'fc2ppv'}
                                 remaining_servers = all_servers - tried_servers
                                 
                                 if remaining_servers:
@@ -827,6 +864,9 @@ class ThumbnailUpdateThread(QThread):
                             
                             if used_queue and hasattr(used_queue, 'task_done'):
                                 used_queue.task_done()
+                    
+                    # while 루프 종료 시 최종 통계 출력
+                    print(f"[{server_name.upper()}] 스레드 최종 종료: 총 처리 {processed_count}개, 발견 {found_count}개 (Thread ID: {thread_id})")
                 
                 # 서버별 스레드 시작 (각 서버당 1개씩만, 병렬 처리)
                 # 각 스레드는 공통 큐와 자신의 재시도 큐를 확인
@@ -841,46 +881,42 @@ class ThumbnailUpdateThread(QThread):
                 )
                 thread.start()
                 worker_threads.append(thread)
+                print(f"[썸네일] MISSAV 스레드 시작 (ID: {thread.ident})")
                 
                 # JAVLibrary 스레드
                 thread = threading.Thread(
                     target=server_worker,
                     args=(priority_queue, 'javlibrary', [main_queue, server_queues['javlibrary']],
-                            [server_queues['missav'], server_queues['javdb'], server_queues['javmost'], server_queues['fc2ppv']]),
+                            [server_queues['missav'], server_queues['javdb'], server_queues['fc2ppv']]),
                     daemon=True
                 )
                 thread.start()
                 worker_threads.append(thread)
+                print(f"[썸네일] JAVLIBRARY 스레드 시작 (ID: {thread.ident})")
                 
                 # JAVDB 스레드
                 thread = threading.Thread(
                     target=server_worker,
                     args=(priority_queue, 'javdb', [main_queue, server_queues['javdb']],
-                            [server_queues['missav'], server_queues['javlibrary'], server_queues['javmost'], server_queues['fc2ppv']]),
+                            [server_queues['missav'], server_queues['javlibrary'], server_queues['fc2ppv']]),
                     daemon=True
                 )
                 thread.start()
                 worker_threads.append(thread)
-                
-                # JAVMOST 스레드
-                thread = threading.Thread(
-                    target=server_worker,
-                    args=(priority_queue, 'javmost', [main_queue, server_queues['javmost']],
-                          [server_queues['missav'], server_queues['javlibrary'], server_queues['javdb'], server_queues['fc2ppv']]),
-                    daemon=True
-                )
-                thread.start()
-                worker_threads.append(thread)
+                print(f"[썸네일] JAVDB 스레드 시작 (ID: {thread.ident})")
                 
                 # FC2PPV 스레드
                 thread = threading.Thread(
                     target=server_worker,
                     args=(priority_queue, 'fc2ppv', [main_queue],
-                          [server_queues['missav'], server_queues['javlibrary'], server_queues['javdb'], server_queues['javmost']]),
+                          [server_queues['missav'], server_queues['javlibrary'], server_queues['javdb']]),
                     daemon=True
                 )
                 thread.start()
                 worker_threads.append(thread)
+                print(f"[썸네일] FC2PPV 스레드 시작 (ID: {thread.ident})")
+                
+                print(f"[썸네일] 총 {len(worker_threads)}개 서버 스레드 실행 중")
                 
                 # 모든 작업 완료 대기 및 진행 상황 업데이트
                 completed_count = 0
@@ -1645,7 +1681,8 @@ class MainWindow(QMainWindow):
                 if len(titles) > 5:
                     titles_str += f" 외 {len(titles) - 5}개"
                 print(f"[썸네일] 페이지 변경 - 우선순위 업데이트: {len(priority_ids)}개 ({titles_str})")
-                self.thumbnail_thread.update_priority_ids(priority_ids)
+                print(f"[썸네일] 우선순위 ID 목록: {priority_ids[:10]}{'...' if len(priority_ids) > 10 else ''}")
+                self.thumbnail_thread.update_priority_ids(priority_ids, force_first=True)
             else:
                 print(f"[썸네일] 페이지 변경 - 현재 페이지에 썸네일 없는 항목 없음")
             return
