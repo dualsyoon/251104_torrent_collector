@@ -479,4 +479,4 @@ if __name__ == "__main__":
     # 동작 확인용 예시 (필요에 따라 수정)
     scrape_javguru("ZSD-74", out_dir="test_images_javguru")
     scrape_javguru("STARS-080", out_dir="test_images_javguru")
-    scrape_javguru("IPZZ-663", out_dir="test_images_javguru")
+    scrape_javguru("EBOD-203", out_dir="test_images_javguru")

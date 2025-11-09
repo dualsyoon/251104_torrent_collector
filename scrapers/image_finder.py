@@ -48,11 +48,14 @@ class ImageFinder:
         # JAVLibrary HTTP 차단 감지 플래그
         self.javlibrary_blocked = False  # HTTP 403이 발생하면 True로 설정
         
-        # JAVBEE, JAVGURU HTTP 차단 감지 플래그
+        # JAVBEE, JAVGURU, JAVMOST HTTP 차단 감지 플래그
         self.javbee_blocked = False  # HTTP 403이 연속 50회 발생하면 True로 설정
         self.javbee_403_count = 0  # 연속 403 응답 카운트
         self.javguru_blocked = False  # HTTP 403이 연속 50회 발생하면 True로 설정
         self.javguru_403_count = 0  # 연속 403 응답 카운트
+        self.javmost_blocked = False  # HTTP 403이 연속 50회 발생하면 True로 설정
+        self.javmost_403_count = 0  # 연속 403 응답 카운트
+        self.javmost_session = None  # JAVMOST 전용 세션 (재활용, 403 시 재생성)
         self.http_timeout = max(3, int(qs.value('images/image_http_timeout', IMAGE_HTTP_TIMEOUT)))
         self.http_retries = max(0, int(qs.value('images/image_http_retries', IMAGE_HTTP_RETRIES)))
         # 공통 플레이스홀더/썸네일 차단 리스트
@@ -266,7 +269,25 @@ class ImageFinder:
                             'snapshots': []
                         }
             
-            # 8) 최후의 수단: FC2PPV.stream (FC2 코드가 있을 때만)
+            # 8) JAVMOST 시도 (모든 형태의 제목 검색 가능)
+            if 'javmost' not in exclude_servers:
+                for code in codes:
+                    urls = self._search_javmost(code)
+                    image_urls.extend(urls)
+                    if len(image_urls) >= max_images:
+                        break
+                
+                # 결과가 있으면 바로 리턴
+                if image_urls:
+                    image_urls = _filter_urls(image_urls)
+                    if image_urls:
+                        print(f"[ImageFinder] JAVMOST 성공!")
+                        return {
+                            'thumbnail': image_urls[0],
+                            'snapshots': []
+                        }
+            
+            # 9) 최후의 수단: FC2PPV.stream (FC2 코드가 있을 때만)
             if 'fc2ppv' not in exclude_servers and fc2_codes:
                 for fc2_code in fc2_codes:
                     urls = self._search_fc2ppv_stream(fc2_code)
@@ -345,6 +366,19 @@ class ImageFinder:
             else:
                 # 코드가 없으면 전체 제목으로 검색
                 urls = self._search_javguru(title)
+                image_urls.extend(urls)
+        
+        # JAV.GURU 실패 시 JAVMOST 시도 (모든 형태의 제목 검색 가능)
+        if 'javmost' not in exclude_servers and not image_urls:
+            if codes:
+                for code in codes:
+                    urls = self._search_javmost(code)
+                    image_urls.extend(urls)
+                    if image_urls:
+                        break
+            else:
+                # 코드가 없으면 전체 제목으로 검색
+                urls = self._search_javmost(title)
                 image_urls.extend(urls)
         
         # JAV.GURU 실패 시 FC2PPV.stream 시도 (FC2 코드가 있을 때만)
@@ -1361,72 +1395,361 @@ class ImageFinder:
         except Exception as e:
             return []
     
-    def _search_javmost(self, code: str) -> List[str]:
-        """javmost.com에서 이미지 검색"""
+    def _search_javmost(self, keyword: str) -> List[str]:
+        """JAVMOST(www5.javmost.com)에서 이미지 검색 (test_javmost_cover_search.py 로직 기반)
+        
+        Args:
+            keyword: 검색 키워드 (작품번호 또는 제목)
+        """
+        if self.javmost_blocked:
+            return []
+        
         try:
-            # javmost.com 검색 URL (CODE 검색)
-            search_url = f"https://www5.javmost.com/search/{quote(code)}"
+            from urllib.parse import urlparse, urljoin as urljoin_parse
+            BASE = "https://www5.javmost.com/"
+            MIN_BYTES = 10 * 1024  # 10KB
+            UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9,ja;q=0.8',
-                'Referer': 'https://www5.javmost.com/'
-            }
+            # 세션 재활용 (403 에러 시에만 재생성)
+            if self.javmost_session is None:
+                self.javmost_session = requests.Session()
+            javmost_session = self.javmost_session
             
-            try:
-                response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
-                if response and response.status_code == 200:
-                    soup = BeautifulSoup(response.content, 'lxml')
-                else:
-                    # HTTP 실패 시 Selenium으로 시도
-                    if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
-                        return self._search_javmost_selenium(code)
+            # 자산 필터
+            THUMB_HOSTS = ("i0.wp.com", "i1.wp.com", "i2.wp.com")
+            ASSET_SEG_RE = re.compile(
+                r"(?:^|/)(?:logo|favicon|sprite|icons?|ads?|adserver|banners?|static|assets|themes|emoji|svg)(?:/|$)",
+                re.I
+            )
+            AD_HOST_RE = re.compile(r"(?:exosrv|exdynsrv|syndication|doubleclick|adnxs|taboola|outbrain|histats)", re.I)
+            
+            def is_probably_asset(u: str) -> bool:
+                pr = urlparse(u)
+                if AD_HOST_RE.search(pr.netloc):
+                    return True
+                path = pr.path
+                if any(host in pr.netloc for host in THUMB_HOSTS):
+                    return True
+                return bool(ASSET_SEG_RE.search(path))
+            
+            def compile_keyword_strict(keyword: str):
+                """문자+숫자 정확 일치, 문자/숫자 사이 '-' 옵션."""
+                m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", keyword.strip())
+                if not m:
+                    k = keyword.strip()
+                    k = re.escape(k).replace(r"\-", "-?")
+                    return re.compile(rf"(?<![A-Za-z0-9]){k}(?![A-Za-z0-9])", re.I)
+                prefix, num = m.groups()
+                return re.compile(
+                    rf"(?<![A-Za-z0-9]){re.escape(prefix)}-?{re.escape(num)}(?![A-Za-z0-9])",
+                    re.I
+                )
+            
+            def normalize_code(keyword: str):
+                """키워드를 'PREFIX-NNN' 형태로 정규화."""
+                m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", keyword.strip())
+                if not m:
+                    return None, None, None
+                prefix, num = m.groups()
+                code = f"{prefix.upper()}-{num}"
+                return prefix.upper(), num, code
+            
+            def make_headers(referer: str | None = None) -> dict:
+                """테스트 코드와 동일한 헤더 생성"""
+                h = {
+                    "User-Agent": UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Upgrade-Insecure-Requests": "1",
+                    "DNT": "1",
+                }
+                if referer:
+                    h["Referer"] = referer
+                return h
+            
+            def get_html(url: str, referer: str | None = None) -> str:
+                """테스트 코드와 동일한 get_html 함수"""
+                r = javmost_session.get(url, headers=make_headers(referer), timeout=25)
+                r.raise_for_status()
+                return r.text
+            
+            def head_or_small_get(url: str, referer: str) -> dict:
+                """이미지 여부/크기 검사: HEAD → 실패 시 작은 GET"""
+                headers = make_headers(referer)
+                try:
+                    r = javmost_session.head(url, headers=headers, allow_redirects=True, timeout=15)
+                    ct = (r.headers.get("content-type") or "").lower()
+                    cl = r.headers.get("content-length")
+                    size = int(cl) if cl and cl.isdigit() else None
+                    return {"ok": ct.startswith("image/"), "final_url": r.url, "ct": ct, "size": size}
+                except Exception:
+                    pass
+                try:
+                    with javmost_session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=25) as g:
+                        ct = (g.headers.get("content-type") or "").lower()
+                        cl = g.headers.get("content-length")
+                        size = int(cl) if cl and cl.isdigit() else None
+                        return {"ok": ct.startswith("image/"), "final_url": g.url, "ct": ct, "size": size}
+                except Exception:
+                    return {"ok": False, "final_url": url, "ct": "", "size": None}
+            
+            def try_direct_view(code: str):
+                """/<CODE>/ 직행 시도."""
+                view = urljoin_parse(BASE, f"{code}/")
+                try:
+                    html = get_html(view, referer=BASE)
+                    soup = BeautifulSoup(html, "lxml")
+                    title = ""
+                    if soup.title and soup.title.get_text():
+                        title = soup.title.get_text(" ", strip=True)
+                    h = soup.find(["h1", "h2"])
+                    if not title and h:
+                        title = h.get_text(" ", strip=True)
+                    return view, (title or "")
+                except Exception:
+                    return None, None
+            
+            def find_from_tag_listing(prefix: str, kw_re: re.Pattern):
+                """/tag/<PREFIX>/ 목록에서 '첫번째 엄격매칭' 포스트 링크를 찾는다."""
+                tag_url = urljoin_parse(BASE, f"tag/{prefix}/")
+                try:
+                    html = get_html(tag_url, referer=BASE)
+                    soup = BeautifulSoup(html, "lxml")
+                    
+                    for a in soup.select("a[href]"):
+                        txt = (a.get_text(" ", strip=True) or "")[:500]
+                        href = a.get("href") or ""
+                        if not href:
+                            continue
+                        if any(seg in href for seg in ("/tag/", "/maker/", "/director/", "/category/", "/search/", "/allcode/")):
+                            continue
+                        if kw_re.search(txt):
+                            return urljoin_parse(BASE, href), txt
+                    return None, None
+                except Exception:
+                    return None, None
+            
+            def resolve_view_url_and_title(keyword: str):
+                """키워드로 상세(view) URL과 제목을 찾아준다."""
+                kw_re = compile_keyword_strict(keyword)
+                prefix, num, code = normalize_code(keyword)
+                
+                # 1) 직접 슬러그
+                if code:
+                    v, t = try_direct_view(code)
+                    if v and kw_re.search((t or "")):
+                        return v, t
+                
+                # 2) 태그 목록 검색
+                if prefix:
+                    v, t = find_from_tag_listing(prefix, kw_re)
+                    if v and t and kw_re.search(t):
+                        return v, t
+                
+                return None, None
+            
+            def find_description_nodes(soup: BeautifulSoup):
+                """상세 페이지에서 주 콘텐츠 영역 후보를 찾는다."""
+                nodes = []
+                nodes.extend(soup.select("article, main, section"))
+                nodes.extend(soup.select("div.post, div.single, div.entry-content, div.content, .container"))
+                if not nodes:
+                    nodes = [soup]
+                seen, uniq = set(), []
+                for n in nodes:
+                    k = str(n)
+                    if k not in seen:
+                        uniq.append(n)
+                        seen.add(k)
+                return uniq[:5]
+            
+            # 403 재시도 로직: 최대 3회 재시도 (서버 접속부터 다시)
+            max_retries = 3
+            view_url = None
+            title_text = None
+            
+            for retry in range(max_retries):
+                try:
+                    view_url, title_text = resolve_view_url_and_title(keyword)
+                    if view_url and title_text:
+                        break
+                except Exception as e:
+                    if retry < max_retries - 1:
+                        time.sleep(1.2)
+                        continue
+                    print(f"[ImageFinder] JAVMOST resolve_view_url_and_title 오류 (키워드: {keyword[:50]}): {e}")
                     return []
-            except (ConnectionError, Timeout, RequestException) as e:
-                # 네트워크 오류 시 Selenium으로 시도
-                if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
-                    return self._search_javmost_selenium(code)
+            
+            if not view_url or not title_text:
+                print(f"[ImageFinder] JAVMOST 상세 페이지를 찾지 못함 (키워드: {keyword[:50]})")
                 return []
             
-            image_urls = []
+            print(f"[ImageFinder] JAVMOST 상세 페이지 발견: {view_url} (제목: {title_text[:50]})")
             
-            # 작품 카드에서 이미지 찾기 (javmost.com 구조에 맞게)
-            video_cards = soup.find_all('div', class_='item')
-            if not video_cards:
-                video_cards = soup.find_all('div', class_='movie-item')
-            if not video_cards:
-                video_cards = soup.find_all('a', class_='box')
-            if not video_cards:
-                video_cards = soup.find_all('div', class_='video-item')
-            if not video_cards:
-                # javmost.com 특정 구조 시도
-                video_cards = soup.find_all('div', class_='thumbnail')
+            # 상세 페이지에서 이미지 추출 (테스트 코드와 동일하게 get_html 사용)
+            # 403 체크를 위해 try-except로 처리
+            html = None
+            for retry in range(max_retries):
+                try:
+                    html = get_html(view_url, referer=BASE)
+                    # 성공 시 403 카운트 리셋
+                    if self.javmost_403_count > 0:
+                        self.javmost_403_count = 0
+                    break
+                except requests.exceptions.HTTPError as e:
+                    if e.response and e.response.status_code == 403:
+                        self.javmost_403_count += 1
+                        print(f"[ImageFinder] JAVMOST 403 응답 ({self.javmost_403_count}/50): {view_url} - 연결을 처음부터 다시 시도")
+                        
+                        if self.javmost_403_count >= 50:
+                            if not self.javmost_blocked:
+                                self.javmost_blocked = True
+                                print(f"[ImageFinder] JAVMOST 403 차단 감지: 50번 연속 403 응답으로 인해 JAVMOST 검색 비활성화")
+                            return []
+                        
+                        if retry < max_retries - 1:
+                            time.sleep(1.2)
+                            # 403 에러 시 세션 재생성
+                            self.javmost_session = requests.Session()
+                            javmost_session = self.javmost_session
+                            try:
+                                javmost_session.get(BASE, headers=make_headers(BASE), timeout=25)
+                            except Exception:
+                                pass
+                            continue
+                        else:
+                            return []
+                    else:
+                        # 403이 아닌 다른 HTTP 오류
+                        if retry < max_retries - 1:
+                            time.sleep(1.2)
+                            continue
+                        else:
+                            print(f"[ImageFinder] JAVMOST HTTP 오류 (키워드: {keyword[:50]}): {e}")
+                            return []
+                except Exception as e:
+                    if retry < max_retries - 1:
+                        time.sleep(1.2)
+                        continue
+                    else:
+                        print(f"[ImageFinder] JAVMOST 상세 페이지 로딩 오류 (키워드: {keyword[:50]}): {e}")
+                        return []
             
-            if video_cards:
-                # 첫 번째 결과의 이미지
-                first_card = video_cards[0]
-                img = first_card.find('img')
-                if img:
-                    img_src = img.get('src', '') or img.get('data-src', '') or img.get('data-original', '') or img.get('data-lazy-src', '')
-                    if img_src:
-                        # 상대 URL 처리
-                        if not img_src.startswith('http'):
-                            if img_src.startswith('//'):
-                                img_src = 'https:' + img_src
-                            elif img_src.startswith('/'):
-                                img_src = 'https://www5.javmost.com' + img_src
-                            else:
-                                img_src = urljoin('https://www5.javmost.com/', img_src)
-                        if img_src.startswith('http'):
-                            image_urls.append(img_src)
+            if not html:
+                return []
             
-            return image_urls
+            soup = BeautifulSoup(html, "lxml")
+            results = []
+            raw = []
+            
+            def add_img_url(u, how):
+                if u:
+                    raw.append({"url": urljoin_parse(view_url, u), "how": how})
+            
+            # 설명/본문 영역 후보
+            nodes = find_description_nodes(soup) or [soup]
+            extra = soup.select("div#main, div#primary, div#content, div.single, div.entry-content")
+            nodes = (nodes + extra)[:8]
+            
+            # 1) 실제 DOM의 <img> + 광범위 data-* 속성 커버
+            DATA_ATTR_HINTS = {
+                "data-src", "data-original", "data-lazy", "data-lazy-src",
+                "data-echo", "data-image", "data-img", "data-url", "data-srcset"
+            }
+            for n in nodes:
+                for img in n.find_all("img"):
+                    add_img_url(img.get("src"), "img.src")
+                    srcset = img.get("srcset")
+                    if srcset:
+                        for p in [p.strip() for p in srcset.split(",") if p.strip()]:
+                            add_img_url(p.split()[0], "img.srcset")
+                    for k, v in img.attrs.items():
+                        if not v or not isinstance(v, str):
+                            continue
+                        if k in DATA_ATTR_HINTS or k.startswith("data-"):
+                            add_img_url(v, f"img.{k}")
+            
+            # 2) noscript 내 <img>
+            for n in nodes:
+                for nos in n.find_all("noscript"):
+                    inner = BeautifulSoup(nos.get_text() or "", "lxml")
+                    for img in inner.find_all("img"):
+                        add_img_url(img.get("src"), "noscript.img.src")
+                        for k in ("data-src", "data-original", "data-lazy", "data-lazy-src"):
+                            add_img_url(img.get(k), f"noscript.img.{k}")
+                        sset = img.get("srcset")
+                        if sset:
+                            for p in [p.strip() for p in sset.split(",") if p.strip()]:
+                                add_img_url(p.split()[0], "noscript.img.srcset")
+            
+            # 3) 메타 폴백
+            for m in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
+                add_img_url(m.get("content"), "meta.og_or_twitter")
+            for l in soup.select('link[rel="image_src"]'):
+                add_img_url(l.get("href"), "link.image_src")
+            
+            # 4) JAVMOST 포스터 추정: https://img{1..5}.javmost.com/images/<CODE>.webp
+            pr = urlparse(view_url)
+            host = pr.netloc.lower()
+            if host.endswith("javmost.com"):
+                slug = pathlib.Path(pr.path).parts[-1].strip("/") or ""
+                mcode = re.search(r"([A-Za-z]+-?\d+)", slug)
+                if mcode:
+                    code = mcode.group(1).upper().replace("--", "-")
+                    for n in ("3", "2", "1", "4", "5"):
+                        cand = f"https://img{n}.javmost.com/images/{code}.webp"
+                        add_img_url(cand, f"poster.guess.img{n}")
+            
+            # 중복 제거
+            seen, cands = set(), []
+            for it in raw:
+                u = (it["url"] or "").strip()
+                if u and u not in seen:
+                    cands.append(it)
+                    seen.add(u)
+            
+            # 필터링 및 검증
+            print(f"[ImageFinder] JAVMOST 후보 이미지 {len(cands)}개 발견, 검증 중...")
+            for item in cands:
+                u, how = item["url"], item["how"]
+                
+                # 자산/광고 제외
+                if is_probably_asset(u):
+                    continue
+                
+                # .html 제외
+                ext = pathlib.Path(urlparse(u).path).suffix.lower()
+                if ext == ".html":
+                    continue
+                
+                # 네트워크 검사: image/* 만 허용 + 최소 용량
+                probe = head_or_small_get(u, view_url)
+                if not probe["ok"]:
+                    continue
+                size_ok = (probe["size"] is None) or (probe["size"] >= MIN_BYTES)
+                if not size_ok:
+                    continue
+                
+                # GIF 제외
+                if probe["ct"] and "gif" in probe["ct"].lower():
+                    continue
+                
+                results.append(u)
+                print(f"[ImageFinder] JAVMOST 이미지 발견: {u[:80]}... (방법: {how})")
+                if len(results) >= 5:
+                    break
+            
+            if results:
+                print(f"[ImageFinder] JAVMOST 총 {len(results)}개 이미지 발견 (키워드: {keyword[:50]})")
+            else:
+                print(f"[ImageFinder] JAVMOST 이미지 없음 (키워드: {keyword[:50]}, 후보: {len(cands)}개)")
+            
+            return results
             
         except Exception as e:
-            # 오류 발생 시 Selenium으로 시도
-            if SELENIUM_AVAILABLE and ENABLE_SELENIUM_FOR_IMAGES:
-                return self._search_javmost_selenium(code)
+            print(f"[ImageFinder] JAVMOST 검색 오류: {e}")
             return []
     
     def _search_javmost_selenium(self, code: str) -> List[str]:
@@ -2650,6 +2973,39 @@ class ImageFinder:
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             
+            # cloudscraper 우선 사용 (테스트 프로그램과 동일)
+            def create_http_client():
+                """cloudscraper 우선, 실패 시 requests.Session"""
+                s = None
+                try:
+                    import cloudscraper
+                    s = cloudscraper.create_scraper(
+                        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                    )
+                except Exception:
+                    s = None
+                if s is None:
+                    s = requests.Session()
+                
+                s.headers.update({
+                    "User-Agent": UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "DNT": "1",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                })
+                try:
+                    s.get(BASE + "/", headers={"Referer": BASE + "/"}, timeout=15)
+                except Exception:
+                    pass
+                return s
+            
+            # JAVGURU 전용 세션 생성 (cloudscraper 우선)
+            javguru_session = create_http_client()
+            
             # 자산 필터
             ASSET_SEG_RE = re.compile(
                 r"(?:^|/)(?:logo|favicon|sprite|icons?|ads?|banners?|static|themes|emoji|svg)(?:/|$)",
@@ -2693,7 +3049,7 @@ class ImageFinder:
                 """이미지 여부/크기 검사: HEAD → 실패 시 작은 GET"""
                 headers = {"User-Agent": UA, "Referer": referer}
                 try:
-                    r = self.session.head(url, headers=headers, allow_redirects=True, timeout=15)
+                    r = javguru_session.head(url, headers=headers, allow_redirects=True, timeout=15)
                     ct = (r.headers.get("content-type") or "").lower()
                     cl = r.headers.get("content-length")
                     size = int(cl) if cl and cl.isdigit() else None
@@ -2701,7 +3057,7 @@ class ImageFinder:
                 except Exception:
                     pass
                 try:
-                    with self.session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=25) as g:
+                    with javguru_session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=25) as g:
                         ct = (g.headers.get("content-type") or "").lower()
                         cl = g.headers.get("content-length")
                         size = int(cl) if cl and cl.isdigit() else None
@@ -2761,7 +3117,7 @@ class ImageFinder:
                 """WP REST 검색: /wp-json/wp/v2/search?search=<keyword>"""
                 api = f"{BASE}/wp-json/wp/v2/search?{urlencode({'search': keyword, 'per_page': 10})}"
                 try:
-                    r = self._safe_get(api, headers={"Referer": BASE + "/"}, timeout=20)
+                    r = javguru_session.get(api, headers={"Referer": BASE + "/"}, timeout=20)
                     if r and r.status_code == 200:
                         data = r.json()
                         for obj in data:
@@ -2778,7 +3134,7 @@ class ImageFinder:
                 """RSS 검색: /?s=<keyword>&feed=rss2"""
                 feed = f"{BASE}/?{urlencode({'s': keyword, 'feed': 'rss2'})}"
                 try:
-                    r = self._safe_get(feed, headers={"Referer": BASE + "/"}, timeout=20)
+                    r = javguru_session.get(feed, headers={"Referer": BASE + "/"}, timeout=20)
                     if r and r.status_code == 200:
                         soup = BeautifulSoup(r.text, "xml")
                         item = soup.find("item")
@@ -2835,9 +3191,6 @@ class ImageFinder:
             # 1) 검색 페이지 시도
             search_url = f"{BASE}/?{urlencode({'s': keyword})}"
             headers = {
-                "User-Agent": UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
                 "Referer": BASE + "/"
             }
             
@@ -2845,7 +3198,14 @@ class ImageFinder:
             max_retries = 3
             response = None
             for retry in range(max_retries):
-                response = self._safe_get(search_url, headers=headers, timeout=25)
+                try:
+                    response = javguru_session.get(search_url, headers=headers, timeout=25, allow_redirects=True)
+                except Exception as e:
+                    if retry < max_retries - 1:
+                        time.sleep(1.2)  # 재시도 전 대기
+                        continue
+                    return []
+                
                 if not response:
                     if retry < max_retries - 1:
                         time.sleep(1.2)  # 재시도 전 대기
@@ -2866,11 +3226,11 @@ class ImageFinder:
                     if retry < max_retries - 1:
                         # 세션 쿠키 초기화하고 처음부터 다시 시도
                         time.sleep(1.2)  # 403 발생 시 대기
-                        self.session.cookies.clear()  # 쿠키 초기화
+                        javguru_session.cookies.clear()  # 쿠키 초기화
                         
                         # 홈페이지 워밍업 (처음부터)
                         try:
-                            self._safe_get(BASE + "/", headers={"Referer": BASE + "/"}, timeout=25)
+                            javguru_session.get(BASE + "/", headers={"Referer": BASE + "/"}, timeout=25)
                         except Exception:
                             pass
                         
@@ -2944,6 +3304,15 @@ class ImageFinder:
                             
                             if results:
                                 return results
+                        else:
+                            # 이미지가 없으면 폴백으로 넘어감 (테스트 프로그램과 동일)
+                            pass
+                    else:
+                        # 제목이 매칭되지 않으면 폴백으로 넘어감 (테스트 프로그램과 동일)
+                        pass
+                else:
+                    # 카드나 제목이 없으면 폴백으로 넘어감 (테스트 프로그램과 동일)
+                    pass
             
             # 2) 폴백: WP REST → RSS
             post_url, post_title = find_first_post_via_rest(keyword)
@@ -2959,8 +3328,11 @@ class ImageFinder:
                 return []
             
             # 포스트 페이지에서 대표 이미지 수집
-            pr = self._safe_get(post_url, headers=headers, timeout=25)
-            if not pr or pr.status_code != 200:
+            try:
+                pr = javguru_session.get(post_url, headers=headers, timeout=25)
+                if not pr or pr.status_code != 200:
+                    return []
+            except Exception:
                 return []
             
             post_imgs = collect_post_cover_images(pr.text, post_url)

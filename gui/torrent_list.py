@@ -409,7 +409,11 @@ class TorrentListWidget(QWidget):
         if magnet_link:
             QDesktopServices.openUrl(QUrl(magnet_link))
         else:
-            QMessageBox.warning(self, "오류", "Magnet 링크가 없습니다.")
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QMessageBox
+            def show_warning_async():
+                QMessageBox.warning(self, "오류", "Magnet 링크가 없습니다.")
+            QTimer.singleShot(0, show_warning_async)
     
     def on_row_double_clicked(self, index):
         """행 더블 클릭 이벤트

@@ -64,214 +64,221 @@ class ThumbnailUpdateThread(QThread):
         print(f"[우선순위 업데이트] 시작: {len(new_priority_ids)}개 항목, force_first={force_first}")
         self._last_priority_ids = new_priority_ids.copy()
         
+        # 별도 스레드에서 실행하여 UI 블로킹 방지
         import threading
-        import queue
-        with self._priority_lock:
-            # 새 우선순위 ID 설정
-            self.priority_ids = new_priority_ids
-            
-            if not self.priority_ids:
-                return
-            
-            # 병렬 처리 중이면 우선순위 리스트에 직접 추가
-            if hasattr(self, 'priority_list') and hasattr(self, 'priority_lock') and hasattr(self, 'main_list') and hasattr(self, 'main_lock') and hasattr(self, 'server_queues'):
-                # force_first=True이면 기존 우선순위 리스트를 완전히 비우고 새 항목만 추가
-                existing_priority_items = []
-                with self.priority_lock:
-                    unprocessed_priority = [x for x in self.priority_list if not x['processed']]
-                    for entry in unprocessed_priority[:]:  # 복사본으로 순회
-                        item = entry['item']
-                        # 새 우선순위에 포함되지 않은 것만 보관 (나중에 뒤에 추가)
-                        if item['id'] not in self.priority_ids:
-                            existing_priority_items.append(item)
-                        # 새 우선순위에 포함된 항목은 제거 (나중에 새로 추가됨)
-                        if force_first or item['id'] in self.priority_ids:
-                            entry['processed'] = True  # 마킹하여 제거 효과
+        def update_priority_worker():
+            """별도 스레드에서 실행되는 우선순위 업데이트 작업"""
+            import queue
+            with self._priority_lock:
+                # 새 우선순위 ID 설정
+                self.priority_ids = new_priority_ids
                 
-                # 현재 리스트에 있는 항목 ID 확인 (중복 방지)
-                existing_ids = set()
+                if not self.priority_ids:
+                    return
                 
-                # main_list에서 기존 항목 ID 확인
-                with self.main_lock:
-                    unprocessed_main = [x for x in self.main_list if not x['processed']]
-                    for entry in unprocessed_main:
-                        item = entry['item']
-                        existing_ids.add(item['id'])
-                
-                # server_queues에서도 확인
-                for q in self.server_queues.values():
-                    temp_items = []
-                    while not q.empty():
-                        try:
-                            item = q.get_nowait()
+                # 병렬 처리 중이면 우선순위 리스트에 직접 추가
+                if hasattr(self, 'priority_list') and hasattr(self, 'priority_lock') and hasattr(self, 'main_list') and hasattr(self, 'main_lock') and hasattr(self, 'server_queues'):
+                    # force_first=True이면 기존 우선순위 리스트를 완전히 비우고 새 항목만 추가
+                    existing_priority_items = []
+                    with self.priority_lock:
+                        unprocessed_priority = [x for x in self.priority_list if not x['processed']]
+                        for entry in unprocessed_priority[:]:  # 복사본으로 순회
+                            item = entry['item']
+                            # 새 우선순위에 포함되지 않은 것만 보관 (나중에 뒤에 추가)
+                            if item['id'] not in self.priority_ids:
+                                existing_priority_items.append(item)
+                            # 새 우선순위에 포함된 항목은 제거 (나중에 새로 추가됨)
+                            if force_first or item['id'] in self.priority_ids:
+                                entry['processed'] = True  # 마킹하여 제거 효과
+                    
+                    # 현재 리스트에 있는 항목 ID 확인 (중복 방지)
+                    existing_ids = set()
+                    
+                    # main_list에서 기존 항목 ID 확인
+                    with self.main_lock:
+                        unprocessed_main = [x for x in self.main_list if not x['processed']]
+                        for entry in unprocessed_main:
+                            item = entry['item']
                             existing_ids.add(item['id'])
-                            temp_items.append(item)
-                        except queue.Empty:
-                            break
-                    for item in temp_items:
-                        q.put(item)
-                
-                # 현재 페이지의 모든 항목을 우선순위 큐에 추가 (이미 큐에 있어도 우선순위로)
-                # 1단계: 기존 리스트에서 현재 페이지 항목 찾아서 우선순위 리스트로 이동
-                priority_items_from_queue = []
-                
-                # main_list에서 현재 페이지 항목 찾기
-                with self.main_lock:
-                    unprocessed_main = [x for x in self.main_list if not x['processed']]
-                    for entry in unprocessed_main[:]:  # 복사본으로 순회
-                        item = entry['item']
-                        if item['id'] in self.priority_ids:
-                            # 현재 페이지 항목이면 우선순위 리스트로 이동
-                            item['is_priority'] = True
-                            # force_first일 때는 force_replace 플래그 추가
-                            if force_first:
-                                item['force_replace'] = True
-                            priority_items_from_queue.append(item)
-                            entry['processed'] = True  # 마킹하여 제거 효과
-                
-                # server_queues에서도 현재 페이지 항목 찾기
-                for q in self.server_queues.values():
-                    temp_items = []
-                    while not q.empty():
-                        try:
-                            item = q.get_nowait()
+                    
+                    # server_queues에서도 확인
+                    for q in self.server_queues.values():
+                        temp_items = []
+                        while not q.empty():
+                            try:
+                                item = q.get_nowait()
+                                existing_ids.add(item['id'])
+                                temp_items.append(item)
+                            except queue.Empty:
+                                break
+                        for item in temp_items:
+                            q.put(item)
+                    
+                    # 현재 페이지의 모든 항목을 우선순위 큐에 추가 (이미 큐에 있어도 우선순위로)
+                    # 1단계: 기존 리스트에서 현재 페이지 항목 찾아서 우선순위 리스트로 이동
+                    priority_items_from_queue = []
+                    
+                    # main_list에서 현재 페이지 항목 찾기
+                    with self.main_lock:
+                        unprocessed_main = [x for x in self.main_list if not x['processed']]
+                        for entry in unprocessed_main[:]:  # 복사본으로 순회
+                            item = entry['item']
                             if item['id'] in self.priority_ids:
-                                # 현재 페이지 항목이면 우선순위 큐로 이동
+                                # 현재 페이지 항목이면 우선순위 리스트로 이동
                                 item['is_priority'] = True
                                 # force_first일 때는 force_replace 플래그 추가
                                 if force_first:
                                     item['force_replace'] = True
                                 priority_items_from_queue.append(item)
-                            else:
-                                temp_items.append(item)
-                        except queue.Empty:
-                            break
-                    # 일반 항목은 다시 큐에 넣기
-                    for item in temp_items:
-                        q.put(item)
-                
-                # 2단계: DB에서 새 항목 가져오기 (큐에 없는 항목만)
-                new_ids = [id for id in self.priority_ids if id not in existing_ids]
-            
-                priority_items_from_db = []
-                if new_ids:
-                    session = self.db.get_session()
-                    try:
-                        from database.models import Torrent
-                        
-                        # 새 항목들만 쿼리
-                        # force_first=True이면 썸네일이 있어도 검색 (교체 기능용)
-                        if force_first:
-                            new_torrents = session.query(Torrent).filter(
-                                Torrent.id.in_(new_ids)
-                            ).all()
-                        else:
-                            # 일반 페이지 변경 시에는 썸네일 없는 항목만
-                            new_torrents = session.query(Torrent).filter(
-                                Torrent.id.in_(new_ids),
-                                (Torrent.thumbnail_url == None) | (Torrent.thumbnail_url == '')
-                            ).all()
-                        
-                        # priority_ids 순서대로 정렬
-                        def safe_sort_key(t):
+                                entry['processed'] = True  # 마킹하여 제거 효과
+                    
+                    # server_queues에서도 현재 페이지 항목 찾기
+                    for q in self.server_queues.values():
+                        temp_items = []
+                        while not q.empty():
                             try:
-                                torrent_id = t.id
-                                if torrent_id in self.priority_ids:
-                                    return self.priority_ids.index(torrent_id)
+                                item = q.get_nowait()
+                                if item['id'] in self.priority_ids:
+                                    # 현재 페이지 항목이면 우선순위 큐로 이동
+                                    item['is_priority'] = True
+                                    # force_first일 때는 force_replace 플래그 추가
+                                    if force_first:
+                                        item['force_replace'] = True
+                                    priority_items_from_queue.append(item)
                                 else:
+                                    temp_items.append(item)
+                            except queue.Empty:
+                                break
+                        # 일반 항목은 다시 큐에 넣기
+                        for item in temp_items:
+                            q.put(item)
+                    
+                    # 2단계: DB에서 새 항목 가져오기 (큐에 없는 항목만)
+                    new_ids = [id for id in self.priority_ids if id not in existing_ids]
+                
+                    priority_items_from_db = []
+                    if new_ids:
+                        session = self.db.get_session()
+                        try:
+                            from database.models import Torrent
+                            
+                            # 새 항목들만 쿼리
+                            # force_first=True이면 썸네일이 있어도 검색 (교체 기능용)
+                            if force_first:
+                                new_torrents = session.query(Torrent).filter(
+                                    Torrent.id.in_(new_ids)
+                                ).all()
+                            else:
+                                # 일반 페이지 변경 시에는 썸네일 없는 항목만
+                                new_torrents = session.query(Torrent).filter(
+                                    Torrent.id.in_(new_ids),
+                                    (Torrent.thumbnail_url == None) | (Torrent.thumbnail_url == '')
+                                ).all()
+                            
+                            # priority_ids 순서대로 정렬
+                            def safe_sort_key(t):
+                                try:
+                                    torrent_id = t.id
+                                    if torrent_id in self.priority_ids:
+                                        return self.priority_ids.index(torrent_id)
+                                    else:
+                                        return 999999
+                                except Exception:
                                     return 999999
-                            except Exception:
+                            
+                            new_torrents_sorted = sorted(new_torrents, key=safe_sort_key)
+                            
+                            # 우선순위 항목을 딕셔너리로 변환
+                            for t in new_torrents_sorted:
+                                try:
+                                    priority_items_from_db.append({
+                                        'id': t.id,
+                                        'title': t.title or '',
+                                        'thumbnail_url': t.thumbnail_url or '',
+                                        'is_priority': True,
+                                        'force_replace': force_first  # force_first일 때 썸네일이 있어도 검색
+                                    })
+                                except Exception:
+                                    continue
+                        finally:
+                            session.close()
+                    
+                    # 3단계: 모든 우선순위 항목을 priority_ids 순서대로 정렬하여 우선순위 큐에 추가
+                    all_priority_items = priority_items_from_queue + priority_items_from_db
+                    
+                    # priority_ids 순서대로 정렬
+                    def priority_sort_key(item):
+                        try:
+                            item_id = item['id']
+                            if item_id in self.priority_ids:
+                                return self.priority_ids.index(item_id)
+                            else:
                                 return 999999
-                        
-                        new_torrents_sorted = sorted(new_torrents, key=safe_sort_key)
-                        
-                        # 우선순위 항목을 딕셔너리로 변환
-                        for t in new_torrents_sorted:
-                            try:
-                                priority_items_from_db.append({
-                                    'id': t.id,
-                                    'title': t.title or '',
-                                    'thumbnail_url': t.thumbnail_url or '',
-                                    'is_priority': True,
-                                    'force_replace': force_first  # force_first일 때 썸네일이 있어도 검색
-                                })
-                            except Exception:
-                                continue
-                    finally:
-                        session.close()
-                
-                # 3단계: 모든 우선순위 항목을 priority_ids 순서대로 정렬하여 우선순위 큐에 추가
-                all_priority_items = priority_items_from_queue + priority_items_from_db
-                
-                # priority_ids 순서대로 정렬
-                def priority_sort_key(item):
-                    try:
-                        item_id = item['id']
-                        if item_id in self.priority_ids:
-                            return self.priority_ids.index(item_id)
-                        else:
+                        except Exception:
                             return 999999
-                    except Exception:
-                        return 999999
-                
-                all_priority_items_sorted = sorted(all_priority_items, key=priority_sort_key)
-                
-                # 우선순위 리스트에 추가 (중복 제거)
-                # force_first=True이면 새 항목만 추가, 아니면 기존 항목 뒤에 추가
-                added_ids = set()
-                with self.priority_lock:
-                    before_list_size = len([x for x in self.priority_list if not x['processed']])
                     
-                if all_priority_items_sorted:
-                    # force_first일 때 디버그 출력
-                    if force_first and all_priority_items_sorted:
-                        print(f"[썸네일 교체] 우선순위 리스트 최우선 추가: {len(all_priority_items_sorted)}개 항목")
-                        for item in all_priority_items_sorted[:3]:  # 처음 3개만 출력
-                            print(f"  - ID: {item['id']}, 제목: {item.get('title', '')[:50]}")
+                    all_priority_items_sorted = sorted(all_priority_items, key=priority_sort_key)
                     
-                    # 새 우선순위 항목들을 추가 (priority_ids 순서대로)
+                    # 우선순위 리스트에 추가 (중복 제거)
+                    # force_first=True이면 새 항목만 추가, 아니면 기존 항목 뒤에 추가
+                    added_ids = set()
                     with self.priority_lock:
-                        added_count = 0
-                        # force_first=True이면 맨 앞에 추가, 아니면 뒤에 추가
-                        if force_first:
-                            # force_first일 때는 역순으로 insert(0, ...)하여 순서 유지
-                            for item in reversed(all_priority_items_sorted):
-                                if item['id'] not in added_ids:
-                                    self.priority_list.insert(0, {'item': item, 'processed': False, 'processing_by': None})
-                                    added_ids.add(item['id'])
-                                    added_count += 1
-                        else:
-                            # 일반적인 경우 뒤에 추가
-                            for item in all_priority_items_sorted:
-                                if item['id'] not in added_ids:
-                                    self.priority_list.append({'item': item, 'processed': False, 'processing_by': None})
-                                    added_ids.add(item['id'])
-                                    added_count += 1
+                        before_list_size = len([x for x in self.priority_list if not x['processed']])
                         
-                        # force_first가 아니면 기존 우선순위 항목들을 뒤에 추가
-                        if not force_first and existing_priority_items:
-                            for existing_item in existing_priority_items:
-                                if existing_item['id'] not in added_ids:
-                                    self.priority_list.append({'item': existing_item, 'processed': False, 'processing_by': None})
-                                    added_ids.add(existing_item['id'])
-                                    added_count += 1
-                        elif force_first and existing_priority_items:
-                            # force_first일 때는 기존 항목을 뒤에 추가 (새 항목이 먼저 처리되도록)
-                            for existing_item in existing_priority_items:
-                                if existing_item['id'] not in added_ids:
-                                    self.priority_list.append({'item': existing_item, 'processed': False, 'processing_by': None})
-                                    added_ids.add(existing_item['id'])
-                                    added_count += 1
+                    if all_priority_items_sorted:
+                        # force_first일 때 디버그 출력
+                        if force_first and all_priority_items_sorted:
+                            print(f"[썸네일 교체] 우선순위 리스트 최우선 추가: {len(all_priority_items_sorted)}개 항목")
+                            for item in all_priority_items_sorted[:3]:  # 처음 3개만 출력
+                                print(f"  - ID: {item['id']}, 제목: {item.get('title', '')[:50]}")
                         
-                        after_list_size = len([x for x in self.priority_list if not x['processed']])
-                        print(f"[우선순위 업데이트] 리스트에 추가 완료: {added_count}개 추가 (리스트 크기: {before_list_size} → {after_list_size})")
-                        print(f"  - 리스트에서 이동: {len(priority_items_from_queue)}개, DB에서 새로 추가: {len(priority_items_from_db)}개")
-                else:
-                    print(f"[우선순위 업데이트] 추가할 항목 없음 (리스트에서 이동: {len(priority_items_from_queue)}개, DB에서 새로 추가: {len(priority_items_from_db)}개)")
-                
-                if all_priority_items_sorted:
-                    moved_count = len(priority_items_from_queue)
-                    new_count = len(priority_items_from_db)
+                        # 새 우선순위 항목들을 추가 (priority_ids 순서대로)
+                        with self.priority_lock:
+                            added_count = 0
+                            # force_first=True이면 맨 앞에 추가, 아니면 뒤에 추가
+                            if force_first:
+                                # force_first일 때는 역순으로 insert(0, ...)하여 순서 유지
+                                for item in reversed(all_priority_items_sorted):
+                                    if item['id'] not in added_ids:
+                                        self.priority_list.insert(0, {'item': item, 'processed': False, 'processing_by': None})
+                                        added_ids.add(item['id'])
+                                        added_count += 1
+                            else:
+                                # 일반적인 경우 뒤에 추가
+                                for item in all_priority_items_sorted:
+                                    if item['id'] not in added_ids:
+                                        self.priority_list.append({'item': item, 'processed': False, 'processing_by': None})
+                                        added_ids.add(item['id'])
+                                        added_count += 1
+                            
+                            # force_first가 아니면 기존 우선순위 항목들을 뒤에 추가
+                            if not force_first and existing_priority_items:
+                                for existing_item in existing_priority_items:
+                                    if existing_item['id'] not in added_ids:
+                                        self.priority_list.append({'item': existing_item, 'processed': False, 'processing_by': None})
+                                        added_ids.add(existing_item['id'])
+                                        added_count += 1
+                            elif force_first and existing_priority_items:
+                                # force_first일 때는 기존 항목을 뒤에 추가 (새 항목이 먼저 처리되도록)
+                                for existing_item in existing_priority_items:
+                                    if existing_item['id'] not in added_ids:
+                                        self.priority_list.append({'item': existing_item, 'processed': False, 'processing_by': None})
+                                        added_ids.add(existing_item['id'])
+                                        added_count += 1
+                            
+                            after_list_size = len([x for x in self.priority_list if not x['processed']])
+                            print(f"[우선순위 업데이트] 리스트에 추가 완료: {added_count}개 추가 (리스트 크기: {before_list_size} → {after_list_size})")
+                            print(f"  - 리스트에서 이동: {len(priority_items_from_queue)}개, DB에서 새로 추가: {len(priority_items_from_db)}개")
+                    else:
+                        print(f"[우선순위 업데이트] 추가할 항목 없음 (리스트에서 이동: {len(priority_items_from_queue)}개, DB에서 새로 추가: {len(priority_items_from_db)}개)")
+                    
+                    if all_priority_items_sorted:
+                        moved_count = len(priority_items_from_queue)
+                        new_count = len(priority_items_from_db)
+        
+        # 별도 스레드에서 실행
+        update_thread = threading.Thread(target=update_priority_worker, daemon=True)
+        update_thread.start()
     
     def run(self):
         """썸네일 없는 항목 찾아서 업데이트 (서버별 스레드 1개씩)"""
@@ -546,11 +553,11 @@ class ThumbnailUpdateThread(QThread):
                                 
                                 # FC2 항목: FC2PPV, JAVDB, JAVGURU만 처리 가능
                                 # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU만 처리 가능
-                                # JAVGURU는 모든 형태의 제목 검색 가능
+                                # JAVGURU, JAVMOST는 모든 형태의 제목 검색 가능
                                 if is_fc2_debug:
-                                    all_servers_debug = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                    all_servers_debug = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                                 else:
-                                    all_servers_debug = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                    all_servers_debug = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                                 
                                 remaining_servers_debug = all_servers_debug - set(searched_servers_debug)
                                 
@@ -587,6 +594,7 @@ class ThumbnailUpdateThread(QThread):
                     'fc2ppv': queue.Queue(),  # FC2 재시도 큐
                     'javbee': queue.Queue(),  # JAVBee 서버 큐
                     'javguru': queue.Queue(),  # JAV.GURU 서버 큐 (모든 형태의 제목 검색 가능)
+                    'javmost': queue.Queue(),  # JAVMOST 서버 큐 (모든 형태의 제목 검색 가능)
                     # 'nyaa': queue.Queue()  # Sukebei Nyaa 서버 큐 (비활성화)
                 }
                 
@@ -710,6 +718,19 @@ class ThumbnailUpdateThread(QThread):
                         else:
                             # 코드가 없으면 전체 제목으로 검색
                             urls = finder._search_javguru(title)
+                            image_urls.extend(urls)
+                    
+                    # JAVMOST 검색 (모든 형태의 제목 검색 가능)
+                    if server == 'javmost':
+                        if codes:
+                            for code in codes:
+                                urls = finder._search_javmost(code)
+                                image_urls.extend(urls)
+                                if image_urls:
+                                    break
+                        else:
+                            # 코드가 없으면 전체 제목으로 검색
+                            urls = finder._search_javmost(title)
                             image_urls.extend(urls)
                     
                     # Sukebei Nyaa 검색 (비활성화)
@@ -1025,6 +1046,11 @@ class ThumbnailUpdateThread(QThread):
                                                 found_count += 1
                                         elif server_name == 'javguru':
                                             # JAVGURU는 모든 형태의 제목 검색 가능
+                                            if put_to_server_queue(server_name, temp_item):
+                                                entry['processed'] = True
+                                                found_count += 1
+                                        elif server_name == 'javmost':
+                                            # JAVMOST는 모든 형태의 제목 검색 가능
                                             if put_to_server_queue(server_name, temp_item):
                                                 entry['processed'] = True
                                                 found_count += 1
@@ -1377,6 +1403,10 @@ class ThumbnailUpdateThread(QThread):
                                                 # JAVGURU는 모든 형태의 제목 검색 가능
                                                 item = temp_item
                                                 used_queue = server_queues[server_name]
+                                            elif server_name == 'javmost':
+                                                # JAVMOST는 모든 형태의 제목 검색 가능
+                                                item = temp_item
+                                                used_queue = server_queues[server_name]
                                             # elif server_name == 'nyaa':  # NYAA 서버 비활성화
                                             #     # NYAA는 모든 형태의 품번 검색 가능
                                             #     item = temp_item
@@ -1476,6 +1506,21 @@ class ThumbnailUpdateThread(QThread):
                                                     print(f"[{server_name.upper()}] {priority_mark}우선순위 큐에서 항목 가져옴 (sent_to_other_servers): {item.get('title', '')[:50]}")
                                                     server_worker._priority_debug_count[server_name] += 1
                                                 break  # 우선순위 리스트에서 찾았으면 즉시 처리
+                                            elif server_name == 'javmost':
+                                                # JAVMOST는 모든 형태의 제목 검색 가능
+                                                item = temp_item
+                                                entry['processed'] = True
+                                                used_queue = 'priority_list'
+                                                # 디버그: 우선순위 큐에서 항목을 가져왔을 때 로그
+                                                if not hasattr(server_worker, '_priority_debug_count'):
+                                                    server_worker._priority_debug_count = {}
+                                                if server_name not in server_worker._priority_debug_count:
+                                                    server_worker._priority_debug_count[server_name] = 0
+                                                if server_worker._priority_debug_count[server_name] < 5:
+                                                    priority_mark = "[우선순위] " if item.get('is_priority', False) else ""
+                                                    print(f"[{server_name.upper()}] {priority_mark}우선순위 큐에서 항목 가져옴 (sent_to_other_servers): {item.get('title', '')[:50]}")
+                                                    server_worker._priority_debug_count[server_name] += 1
+                                                break  # 우선순위 리스트에서 찾았으면 즉시 처리
                                             # elif server_name == 'nyaa':  # NYAA 서버 비활성화
                                             #     # NYAA는 모든 형태의 품번 검색 가능
                                             #     item = temp_item
@@ -1549,6 +1594,21 @@ class ThumbnailUpdateThread(QThread):
                                                 break  # 우선순위 리스트에서 찾았으면 즉시 처리
                                             elif server_name == 'javguru':
                                                 # JAVGURU는 모든 형태의 제목 검색 가능
+                                                item = temp_item
+                                                entry['processed'] = True
+                                                used_queue = 'priority_list'
+                                                # 디버그: 우선순위 큐에서 항목을 가져왔을 때 로그
+                                                if not hasattr(server_worker, '_priority_debug_count'):
+                                                    server_worker._priority_debug_count = {}
+                                                if server_name not in server_worker._priority_debug_count:
+                                                    server_worker._priority_debug_count[server_name] = 0
+                                                if server_worker._priority_debug_count[server_name] < 5:
+                                                    priority_mark = "[우선순위] " if item.get('is_priority', False) else ""
+                                                    print(f"[{server_name.upper()}] {priority_mark}우선순위 큐에서 항목 가져옴: {item.get('title', '')[:50]}")
+                                                    server_worker._priority_debug_count[server_name] += 1
+                                                break  # 우선순위 리스트에서 찾았으면 즉시 처리
+                                            elif server_name == 'javmost':
+                                                # JAVMOST는 모든 형태의 제목 검색 가능
                                                 item = temp_item
                                                 entry['processed'] = True
                                                 used_queue = 'priority_list'
@@ -1637,6 +1697,12 @@ class ThumbnailUpdateThread(QThread):
                                                 break
                                             elif server_name == 'javguru':
                                                 # JAVGURU는 모든 형태의 제목 검색 가능
+                                                item = temp_item
+                                                entry['processed'] = True
+                                                used_queue = 'main_list'
+                                                break
+                                            elif server_name == 'javmost':
+                                                # JAVMOST는 모든 형태의 제목 검색 가능
                                                 item = temp_item
                                                 entry['processed'] = True
                                                 used_queue = 'main_list'
@@ -1985,6 +2051,11 @@ class ThumbnailUpdateThread(QThread):
                                                         item = temp_item
                                                         used_queue = source_queue
                                                         break
+                                                    elif server_name == 'javmost':
+                                                        # JAVMOST는 모든 형태의 제목 검색 가능
+                                                        item = temp_item
+                                                        used_queue = source_queue
+                                                        break
                                                     # elif server_name == 'nyaa':  # NYAA 서버 비활성화
                                                     #     # NYAA는 모든 형태의 품번 검색 가능
                                                     #     item = temp_item
@@ -2116,6 +2187,22 @@ class ThumbnailUpdateThread(QThread):
                                                         # 서버 큐가 가득 차면 더 이상 추가하지 않음
                                                         if found_count >= max_find:
                                                             break
+                                                    # JAVGURU는 모든 형태의 제목 검색 가능
+                                                    elif server_name == 'javguru':
+                                                        # JAVGURU 큐에 추가 (최대 2개)
+                                                        if put_to_server_queue('javguru', temp_item):
+                                                            found_count += 1
+                                                        # 서버 큐가 가득 차면 더 이상 추가하지 않음
+                                                        if found_count >= max_find:
+                                                            break
+                                                    # JAVMOST는 모든 형태의 제목 검색 가능
+                                                    elif server_name == 'javmost':
+                                                        # JAVMOST 큐에 추가 (최대 2개)
+                                                        if put_to_server_queue('javmost', temp_item):
+                                                            found_count += 1
+                                                        # 서버 큐가 가득 차면 더 이상 추가하지 않음
+                                                        if found_count >= max_find:
+                                                            break
                                                     else:
                                                         # 처리하지 않은 항목만 다시 큐로
                                                         source_queue.put(temp_item)
@@ -2169,6 +2256,14 @@ class ThumbnailUpdateThread(QThread):
                                 if not server_blocked:
                                     server_blocked = True
                                     print(f"[{server_name.upper()}] ⚠️ 403 차단 감지: JAVGURU 서버 차단으로 인해 스레드 즉시 종료 (Thread ID: {thread_id})")
+                                    # 스레드 상태 업데이트
+                                    with thread_status_lock:
+                                        if server_name in thread_status:
+                                            thread_status[server_name]['blocked'] = True
+                            elif server_name == 'javmost' and thread_finder.javmost_blocked:
+                                if not server_blocked:
+                                    server_blocked = True
+                                    print(f"[{server_name.upper()}] ⚠️ 403 차단 감지: JAVMOST 서버 차단으로 인해 스레드 즉시 종료 (Thread ID: {thread_id})")
                                     # 스레드 상태 업데이트
                                     with thread_status_lock:
                                         if server_name in thread_status:
@@ -2259,13 +2354,7 @@ class ThumbnailUpdateThread(QThread):
                                         torrent.thumbnail_searched_servers = json.dumps(current_searched_servers)
                                         work_session.commit()
                                 
-                                # 다시 한번 확인 (다른 서버에서 이미 찾았을 수 있음)
-                                with status_lock:
-                                    if torrent_id in torrent_status and torrent_status[torrent_id].get('found'):
-                                        if used_queue != 'priority_list' and hasattr(used_queue, 'task_done'):
-                                            used_queue.task_done()
-                                        continue
-                                
+                                # thumbnail_url이 있으면 카운트해야 하므로, 이미 다른 서버에서 찾았는지 확인은 thumbnail_url 체크 후에
                                 if thumbnail_url:
                                     thumbnail_url_lower = thumbnail_url.lower()
                                     
@@ -2324,40 +2413,37 @@ class ThumbnailUpdateThread(QThread):
                                     try:
                                         priority_mark = "[우선순위] " if is_priority else ""
                                         
+                                        # already_found 변수를 status_lock 밖에서도 사용할 수 있도록 미리 선언
+                                        already_found = False
+                                        
                                         with status_lock:
                                             # 이미 다른 서버에서 찾았는지 재확인
                                             already_found = torrent_id in torrent_status and torrent_status[torrent_id].get('found')
                                             
+                                            # 썸네일을 찾았으므로 항상 카운트 증가 (각 서버별 발견 횟수 추적)
+                                            found_count += 1
+                                            consecutive_no_found = 0  # 연속 실패 카운트 리셋
+                                            
                                             if not already_found:
-                                                # 실제로 새로 찾은 경우에만 카운트 증가
-                                                found_count += 1
-                                                consecutive_no_found = 0  # 연속 실패 카운트 리셋
-                                                
+                                                # 실제로 새로 찾은 경우
                                                 torrent_status[torrent_id] = {'found': True, 'thumbnail_url': thumbnail_url, 'tried_servers': set()}
-                                            else:
-                                                # 이미 찾은 항목이지만 이 서버에서도 찾았으므로 카운트 증가 (각 서버별 발견 횟수 추적)
-                                                found_count += 1
-                                                consecutive_no_found = 0  # 연속 실패 카운트 리셋
-                                                
-                                                # 스레드 상태 업데이트 (카운트 증가 후, continue 전에)
-                                                with thread_status_lock:
-                                                    if server_name in thread_status:
-                                                        thread_status[server_name]['found'] = found_count
-                                                
-                                                # 출력은 status_lock 밖에서 (카운트 증가 후)
-                                                print(f"[{server_name.upper()}] {priority_mark}썸네일 발견: {title[:50]}... ({thumbnail_url})")
-                                                
-                                                if used_queue != 'priority_list' and hasattr(used_queue, 'task_done'):
-                                                    used_queue.task_done()
-                                                continue
+                                        
+                                        # 스레드 상태 업데이트 (status_lock 밖에서, thread_status_lock으로 보호)
+                                        with thread_status_lock:
+                                            if server_name in thread_status:
+                                                # thread_status의 found를 직접 증가시켜서 동기화 문제 방지
+                                                thread_status[server_name]['found'] = thread_status[server_name].get('found', 0) + 1
+                                                # 로컬 found_count도 동기화
+                                                found_count = thread_status[server_name]['found']
                                         
                                         # 출력은 status_lock 밖에서 (카운트 증가 후)
                                         print(f"[{server_name.upper()}] {priority_mark}썸네일 발견: {title[:50]}... ({thumbnail_url})")
                                         
-                                        # 스레드 상태 업데이트 (카운트 증가 후)
-                                        with thread_status_lock:
-                                            if server_name in thread_status:
-                                                thread_status[server_name]['found'] = found_count
+                                        # already_found가 True일 때만 continue (이미 thread_status 업데이트 완료)
+                                        if already_found:
+                                            if used_queue != 'priority_list' and hasattr(used_queue, 'task_done'):
+                                                used_queue.task_done()
+                                            continue
                                         
                                         # DB에 저장 (DB_writer 사용)
                                         if self.db_writer:
@@ -2598,6 +2684,16 @@ class ThumbnailUpdateThread(QThread):
                     target=server_worker,
                     args=(priority_list, priority_lock, main_list, main_lock, 'javguru',
                           [server_queues['javdb'], server_queues['javbee'], server_queues['fc2ppv']]),  # javdb, javbee, fc2ppv
+                    daemon=True
+                )
+                thread.start()
+                worker_threads.append(thread)
+                
+                # JAVMOST 스레드 (모든 형태의 제목 검색 가능)
+                thread = threading.Thread(
+                    target=server_worker,
+                    args=(priority_list, priority_lock, main_list, main_lock, 'javmost',
+                          [server_queues['javdb'], server_queues['javbee'], server_queues['fc2ppv'], server_queues['javguru']]),  # javdb, javbee, fc2ppv, javguru
                     daemon=True
                 )
                 thread.start()
@@ -3299,7 +3395,8 @@ class MainWindow(QMainWindow):
         # 상태바
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("준비됨")
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("준비됨"))
     
     def create_menu_bar(self):
         """메뉴바 생성"""
@@ -3439,65 +3536,84 @@ class MainWindow(QMainWindow):
         """전체 DB에서 썸네일 검색 서버 항목 초기화"""
         from PySide6.QtWidgets import QMessageBox
         
-        reply = QMessageBox.question(
-            self,
-            "확인",
-            "전체 DB의 썸네일 검색 서버 목록을 초기화하시겠습니까?\n\n이 작업은 모든 토렌트의 검색 서버 기록을 삭제하여 다시 검색할 수 있게 합니다.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
+        # QMessageBox를 비동기로 처리하여 UI 블로킹 방지
+        from PySide6.QtCore import QTimer
         
-        if reply == QMessageBox.Yes:
-            from PySide6.QtCore import QThread, Signal
+        def show_question_async():
+            reply = QMessageBox.question(
+                self,
+                "확인",
+                "전체 DB의 썸네일 검색 서버 목록을 초기화하시겠습니까?\n\n이 작업은 모든 토렌트의 검색 서버 기록을 삭제하여 다시 검색할 수 있게 합니다.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
             
-            class ResetSearchedServersThread(QThread):
-                finished = Signal(int)  # (초기화된 개수)
-                error = Signal(str)
-                
-                def __init__(self, db):
-                    super().__init__()
-                    self.db = db
-                
-                def run(self):
+            if reply == QMessageBox.Yes:
+                self._execute_reset_searched_servers()
+        
+        QTimer.singleShot(0, show_question_async)
+    
+    def _execute_reset_searched_servers(self):
+        """검색 서버 초기화 실행"""
+        from PySide6.QtCore import QThread, Signal
+        
+        class ResetSearchedServersThread(QThread):
+            finished = Signal(int)  # (초기화된 개수)
+            error = Signal(str)
+            
+            def __init__(self, db):
+                super().__init__()
+                self.db = db
+            
+            def run(self):
+                try:
+                    session = self.db.get_session()
                     try:
-                        session = self.db.get_session()
-                        try:
-                            from database.models import Torrent
-                            
-                            # 모든 토렌트 조회
-                            all_torrents = session.query(Torrent).all()
-                            
-                            reset_count = 0
-                            for torrent in all_torrents:
-                                if torrent.thumbnail_searched_servers and torrent.thumbnail_searched_servers.strip():
-                                    torrent.thumbnail_searched_servers = '[]'
-                                    reset_count += 1
-                            
-                            session.commit()
-                            self.finished.emit(reset_count)
-                        finally:
-                            session.close()
-                    except Exception as e:
-                        self.error.emit(str(e))
-            
-            # 백그라운드 스레드로 실행 (멤버 변수로 저장하여 소멸 방지)
-            self.reset_searched_servers_thread = ResetSearchedServersThread(self.db)
-            self.reset_searched_servers_thread.finished.connect(self._on_reset_searched_servers_finished)
-            self.reset_searched_servers_thread.error.connect(self._on_reset_searched_servers_error)
-            self.reset_searched_servers_thread.start()
-            
-            self.status_bar.showMessage("썸네일 검색 서버 초기화 중...", 0)
+                        from database.models import Torrent
+                        
+                        # 모든 토렌트 조회
+                        all_torrents = session.query(Torrent).all()
+                        
+                        reset_count = 0
+                        for torrent in all_torrents:
+                            if torrent.thumbnail_searched_servers and torrent.thumbnail_searched_servers.strip():
+                                torrent.thumbnail_searched_servers = '[]'
+                                reset_count += 1
+                        
+                        session.commit()
+                        self.finished.emit(reset_count)
+                    finally:
+                        session.close()
+                except Exception as e:
+                    self.error.emit(str(e))
+        
+        # 백그라운드 스레드로 실행 (멤버 변수로 저장하여 소멸 방지)
+        self.reset_searched_servers_thread = ResetSearchedServersThread(self.db)
+        self.reset_searched_servers_thread.finished.connect(self._on_reset_searched_servers_finished)
+        self.reset_searched_servers_thread.error.connect(self._on_reset_searched_servers_error)
+        self.reset_searched_servers_thread.start()
+        
+        # 상태 바 업데이트를 비동기로 처리
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("썸네일 검색 서버 초기화 중...", 0))
     
     def _on_reset_searched_servers_finished(self, count: int):
         """검색 서버 초기화 완료 처리"""
-        self.status_bar.showMessage(f"썸네일 검색 서버 초기화 완료: {count}개 항목", 5000)
-        print(f"[초기화] 썸네일 검색 서버 초기화 완료: {count}개 항목")
+        from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QMessageBox
-        QMessageBox.information(
-            self,
-            "완료",
-            f"썸네일 검색 서버 초기화가 완료되었습니다.\n\n초기화된 항목: {count}개"
-        )
+        
+        # 상태 바 업데이트를 비동기로 처리
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"썸네일 검색 서버 초기화 완료: {count}개 항목", 5000))
+        print(f"[초기화] 썸네일 검색 서버 초기화 완료: {count}개 항목")
+        
+        # QMessageBox를 비동기로 처리
+        def show_info_async():
+            QMessageBox.information(
+                self,
+                "완료",
+                f"썸네일 검색 서버 초기화가 완료되었습니다.\n\n초기화된 항목: {count}개"
+            )
+        QTimer.singleShot(0, show_info_async)
         # 스레드 정리
         if self.reset_searched_servers_thread:
             self.reset_searched_servers_thread.quit()
@@ -3506,14 +3622,21 @@ class MainWindow(QMainWindow):
     
     def _on_reset_searched_servers_error(self, error_msg: str):
         """검색 서버 초기화 오류 처리"""
-        self.status_bar.showMessage(f"초기화 오류: {error_msg}", 5000)
-        print(f"[초기화] 썸네일 검색 서버 초기화 오류: {error_msg}")
+        from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QMessageBox
-        QMessageBox.critical(
-            self,
-            "오류",
-            f"썸네일 검색 서버 초기화 중 오류가 발생했습니다:\n\n{error_msg}"
-        )
+        
+        # 상태 바 업데이트를 비동기로 처리
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"초기화 오류: {error_msg}", 5000))
+        print(f"[초기화] 썸네일 검색 서버 초기화 오류: {error_msg}")
+        
+        # QMessageBox를 비동기로 처리
+        def show_error_async():
+            QMessageBox.critical(
+                self,
+                "오류",
+                f"썸네일 검색 서버 초기화 중 오류가 발생했습니다:\n\n{error_msg}"
+            )
+        QTimer.singleShot(0, show_error_async)
         # 스레드 정리
         if self.reset_searched_servers_thread:
             self.reset_searched_servers_thread.quit()
@@ -3604,9 +3727,12 @@ class MainWindow(QMainWindow):
         
         QTimer.singleShot(0, update_async)
         
-        # 버튼 활성화/비활성화
-        self.prev_btn.setEnabled(self.current_page > 1)
-        self.next_btn.setEnabled(self.current_page < self.total_pages)
+        # 버튼 활성화/비활성화도 비동기로 처리
+        def update_buttons():
+            self.prev_btn.setEnabled(self.current_page > 1)
+            self.next_btn.setEnabled(self.current_page < self.total_pages)
+        
+        QTimer.singleShot(0, update_buttons)
     
     def prev_page(self):
         """이전 페이지"""
@@ -3628,9 +3754,17 @@ class MainWindow(QMainWindow):
                 self.current_page = page
                 self.load_torrents()
             else:
-                QMessageBox.warning(self, "경고", f"1-{self.total_pages} 범위의 페이지를 입력하세요.")
+                from PySide6.QtCore import QTimer
+                from PySide6.QtWidgets import QMessageBox
+                def show_warning_async():
+                    QMessageBox.warning(self, "경고", f"1-{self.total_pages} 범위의 페이지를 입력하세요.")
+                QTimer.singleShot(0, show_warning_async)
         except ValueError:
-            QMessageBox.warning(self, "경고", "올바른 페이지 번호를 입력하세요.")
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QMessageBox
+            def show_warning_async():
+                QMessageBox.warning(self, "경고", "올바른 페이지 번호를 입력하세요.")
+            QTimer.singleShot(0, show_warning_async)
     
     def on_filter_changed(self, filters: dict):
         """필터 변경 이벤트"""
@@ -3652,7 +3786,11 @@ class MainWindow(QMainWindow):
     def fetch_torrents(self):
         """새 토렌트 수집"""
         if self.scraper_thread and self.scraper_thread.isRunning():
-            QMessageBox.warning(self, "경고", "이미 수집 작업이 진행 중입니다.")
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QMessageBox
+            def show_warning_async():
+                QMessageBox.warning(self, "경고", "이미 수집 작업이 진행 중입니다.")
+            QTimer.singleShot(0, show_warning_async)
             return
         
         # 선택된 소스 가져오기
@@ -3694,49 +3832,65 @@ class MainWindow(QMainWindow):
         """스크래핑 중단"""
         if self.scraper_thread and self.scraper_thread.isRunning():
             self.scraper_thread.stop()
-            self.stop_btn.setEnabled(False)
-            self.status_bar.showMessage("수집 중단 중...")
+            from PySide6.QtCore import QTimer
+            def update_ui_async():
+                self.stop_btn.setEnabled(False)
+                self.status_bar.showMessage("수집 중단 중...")
+            QTimer.singleShot(0, update_ui_async)
     
     def on_scrape_progress(self, value: int, message: str):
         """스크래핑 진행 상황 업데이트"""
-        self.progress_bar.setValue(value)
-        self.status_bar.showMessage(message)
+        from PySide6.QtCore import QTimer
+        def update_ui_async():
+            self.progress_bar.setValue(value)
+            self.status_bar.showMessage(message)
+        QTimer.singleShot(0, update_ui_async)
     
     def on_scrape_finished(self, added_count: int, updated_count: int, was_stopped: bool = False):
         """스크래핑 완료"""
-        self.fetch_btn.setEnabled(True)
-        self.source_combo.setEnabled(True)
-        self.search_input.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setVisible(False)
-        self.progress_bar.setVisible(False)
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QMessageBox
         
         total = added_count + updated_count
         
-        if was_stopped:
-            message = f"수집 중단: 신규 {added_count}개, 업데이트 {updated_count}개 (총 {total}개) 저장됨"
-            self.status_bar.showMessage(message)
+        def update_ui_async():
+            self.fetch_btn.setEnabled(True)
+            self.source_combo.setEnabled(True)
+            self.search_input.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.stop_btn.setVisible(False)
+            self.progress_bar.setVisible(False)
             
-            QMessageBox.information(
-                self, 
-                "수집 중단", 
-                f"수집이 중단되었습니다.\n\n"
-                f"지금까지 수집한 데이터:\n"
-                f"신규 추가: {added_count}개\n"
-                f"기존 업데이트: {updated_count}개\n"
-                f"총 처리: {total}개"
-            )
-        else:
-            message = f"수집 완료: 신규 {added_count}개, 업데이트 {updated_count}개 (총 {total}개)"
-            self.status_bar.showMessage(message)
-            
-            QMessageBox.information(
-                self, 
-                "완료", 
-                f"신규 추가: {added_count}개\n"
-                f"기존 업데이트: {updated_count}개\n"
-                f"총 처리: {total}개"
-            )
+            if was_stopped:
+                message = f"수집 중단: 신규 {added_count}개, 업데이트 {updated_count}개 (총 {total}개) 저장됨"
+                self.status_bar.showMessage(message)
+                
+                def show_info_async():
+                    QMessageBox.information(
+                        self, 
+                        "수집 중단", 
+                        f"수집이 중단되었습니다.\n\n"
+                        f"지금까지 수집한 데이터:\n"
+                        f"신규 추가: {added_count}개\n"
+                        f"기존 업데이트: {updated_count}개\n"
+                        f"총 처리: {total}개"
+                    )
+                QTimer.singleShot(0, show_info_async)
+            else:
+                message = f"수집 완료: 신규 {added_count}개, 업데이트 {updated_count}개 (총 {total}개)"
+                self.status_bar.showMessage(message)
+                
+                def show_info_async():
+                    QMessageBox.information(
+                        self, 
+                        "완료", 
+                        f"신규 추가: {added_count}개\n"
+                        f"기존 업데이트: {updated_count}개\n"
+                        f"총 처리: {total}개"
+                    )
+                QTimer.singleShot(0, show_info_async)
+        
+        QTimer.singleShot(0, update_ui_async)
         
         # 목록 새로고침
         self.load_torrents()
@@ -3750,44 +3904,68 @@ class MainWindow(QMainWindow):
     
     def on_scrape_error(self, error_msg: str):
         """스크래핑 오류"""
-        self.fetch_btn.setEnabled(True)
-        self.source_combo.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setVisible(False)
-        self.progress_bar.setVisible(False)
-        self.status_bar.showMessage("수집 실패")
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QMessageBox
         
-        QMessageBox.critical(self, "오류", f"토렌트 수집 실패:\n{error_msg}")
+        def update_ui_async():
+            self.fetch_btn.setEnabled(True)
+            self.source_combo.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.stop_btn.setVisible(False)
+            self.progress_bar.setVisible(False)
+            self.status_bar.showMessage("수집 실패")
+            
+            def show_error_async():
+                QMessageBox.critical(self, "오류", f"토렌트 수집 실패:\n{error_msg}")
+            QTimer.singleShot(0, show_error_async)
+        
+        QTimer.singleShot(0, update_ui_async)
     
     def show_about(self):
         """정보 다이얼로그 표시"""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QMessageBox
+        
         sources = self.scraper_manager.get_available_sources()
         sources_list = "<br>".join([f"• {info['name']}: {info['description']}" 
                                     for info in sources.values()])
         
-        QMessageBox.about(
-            self,
-            "토렌트 수집기 정보",
-            "<h3>토렌트 수집기</h3>"
-            "<p>성인 토렌트 사이트에서 데이터를 수집하고 관리하는 애플리케이션입니다.</p>"
-            "<p><b>버전:</b> 2.0.0</p>"
-            "<p><b>개발:</b> Python + PySide6</p>"
-            "<p><b>지원 소스:</b></p>"
-            f"<p style='margin-left: 20px;'>{sources_list}</p>"
-        )
+        def show_about_async():
+            QMessageBox.about(
+                self,
+                "토렌트 수집기 정보",
+                "<h3>토렌트 수집기</h3>"
+                "<p>성인 토렌트 사이트에서 데이터를 수집하고 관리하는 애플리케이션입니다.</p>"
+                "<p><b>버전:</b> 2.0.0</p>"
+                "<p><b>개발:</b> Python + PySide6</p>"
+                "<p><b>지원 소스:</b></p>"
+                f"<p style='margin-left: 20px;'>{sources_list}</p>"
+            )
+        QTimer.singleShot(0, show_about_async)
 
     def fix_missing_dates(self):
         """업로드 날짜가 비어있는 항목을 원본에서 보정"""
-        session = self.db.get_session()
-        try:
-            fixed = self.db.backfill_missing_dates(session, limit=1000)
-            QMessageBox.information(self, "날짜 보정", f"보정된 항목: {fixed}개")
-            if fixed:
-                self.load_torrents()
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"날짜 보정 실패: {e}")
-        finally:
-            session.close()
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QMessageBox
+        
+        def fix_dates_async():
+            session = self.db.get_session()
+            try:
+                fixed = self.db.backfill_missing_dates(session, limit=1000)
+                
+                def show_result_async():
+                    QMessageBox.information(self, "날짜 보정", f"보정된 항목: {fixed}개")
+                    if fixed:
+                        self.load_torrents()
+                QTimer.singleShot(0, show_result_async)
+            except Exception as e:
+                def show_error_async():
+                    QMessageBox.critical(self, "오류", f"날짜 보정 실패: {e}")
+                QTimer.singleShot(0, show_error_async)
+            finally:
+                session.close()
+        
+        QTimer.singleShot(0, fix_dates_async)
 
     def start_thumbnail_update_for_missing(self):
         """이미지 없는 모든 항목의 썸네일 업데이트 시작 (수집 완료 후 호출)"""
@@ -3942,18 +4120,21 @@ class MainWindow(QMainWindow):
     def on_thumbnail_progress(self, value: int, message: str):
         """썸네일 업데이트 진행 상황"""
         # 상태바에만 표시 (조용하게)
-        self.status_bar.showMessage(f"[백그라운드] {message}")
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"[백그라운드] {message}"))
     
     def on_thumbnail_finished(self, updated_count: int):
         """썸네일 업데이트 완료"""
+        from PySide6.QtCore import QTimer
+        
         if updated_count > 0:
             print(f"[썸네일] 백그라운드 업데이트 완료: {updated_count}개")
-            self.status_bar.showMessage(f"썸네일 {updated_count}개 업데이트 완료", 3000)
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"썸네일 {updated_count}개 업데이트 완료", 3000))
             # 목록 새로고침 (썸네일이 보이도록, 단 썸네일 업데이트는 다시 시작하지 않음)
-            self.torrent_list.refresh_thumbnails()  # 썸네일만 새로고침
+            QTimer.singleShot(0, lambda: self.torrent_list.refresh_thumbnails())  # 썸네일만 새로고침
         else:
             print("[썸네일] 업데이트할 항목이 없습니다.")
-            self.status_bar.showMessage("썸네일 업데이트 완료 (모든 항목 최신)", 2000)
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("썸네일 업데이트 완료 (모든 항목 최신)", 2000))
         
         # 썸네일 교체 요청 항목 중 아직 활성화되지 않은 버튼들 활성화 (썸네일을 찾지 못한 경우 포함)
         if self.pending_replace_ids:
@@ -3963,8 +4144,9 @@ class MainWindow(QMainWindow):
     
     def on_thumbnail_error(self, error_msg: str):
         """썸네일 업데이트 오류"""
+        from PySide6.QtCore import QTimer
         print(f"[썸네일] 오류: {error_msg}")
-        self.status_bar.showMessage(f"썸네일 업데이트 오류: {error_msg}", 3000)
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"썸네일 업데이트 오류: {error_msg}", 3000))
         # 썸네일 교체 요청 항목이면 버튼 활성화 (오류 발생 시에도)
         # pending_replace_ids에서 모든 항목 확인 (오류 메시지에 torrent_id가 없을 수 있음)
         # 하지만 일반적으로 오류는 전체 업데이트 스레드에서 발생하므로 여기서는 처리하지 않음
@@ -4085,8 +4267,9 @@ class MainWindow(QMainWindow):
             # 비동기로 처리 실행
             QTimer.singleShot(0, process_replace_async)
         except Exception as e:
-            self.status_bar.showMessage(f"썸네일 교체 오류: {e}", 3000)
-            self.torrent_list.enable_replace_button(torrent_id)
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"썸네일 교체 오류: {e}", 3000))
+            QTimer.singleShot(0, lambda: self.torrent_list.enable_replace_button(torrent_id))
     
     def _process_replace_queue(self):
         """교체 큐에서 다음 작업 처리"""
@@ -4102,29 +4285,32 @@ class MainWindow(QMainWindow):
             
             # 완료/오류 시 다음 큐 항목 처리
             def _on_completed(tid, url):
+                from PySide6.QtCore import QTimer
                 self.on_thumbnail_item_updated(tid, url)
                 remaining = self.replace_queue.qsize()
                 if remaining > 0:
-                    self.status_bar.showMessage(f"✅ 교체 완료! 남은 작업: {remaining}개", 2000)
+                    QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"✅ 교체 완료! 남은 작업: {remaining}개", 2000))
                 else:
-                    self.status_bar.showMessage("✅ 모든 썸네일 교체 완료!", 2000)
-                self.torrent_list.enable_replace_button(tid)
+                    QTimer.singleShot(0, lambda: self.status_bar.showMessage("✅ 모든 썸네일 교체 완료!", 2000))
+                QTimer.singleShot(0, lambda: self.torrent_list.enable_replace_button(tid))
                 # 다음 큐 항목 처리
-                self._process_replace_queue()
+                QTimer.singleShot(0, self._process_replace_queue)
             
             def _on_error(e):
+                from PySide6.QtCore import QTimer
                 remaining = self.replace_queue.qsize()
-                self.status_bar.showMessage(f"❌ 교체 실패: {e} (남은 작업: {remaining}개)", 3000)
-                self.torrent_list.enable_replace_button(torrent_id)
+                QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"❌ 교체 실패: {e} (남은 작업: {remaining}개)", 3000))
+                QTimer.singleShot(0, lambda: self.torrent_list.enable_replace_button(torrent_id))
                 # 다음 큐 항목 처리
-                self._process_replace_queue()
+                QTimer.singleShot(0, self._process_replace_queue)
             
             self.replace_worker.updated.connect(_on_completed)
             self.replace_worker.error.connect(_on_error)
             self.replace_worker.start()
             
         except Exception as e:
-            self.status_bar.showMessage(f"큐 처리 오류: {e}", 3000)
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"큐 처리 오류: {e}", 3000))
     
     def get_current_page_ids(self) -> list:
         """현재 페이지에 표시된 항목들의 ID 반환 (이미 로드된 데이터 사용)"""
