@@ -326,8 +326,6 @@ class ScraperManager:
                         print(f"[{source['name']}] 사용자에 의해 중단됨 (페이지 {page}에서)")
                         break
                     
-                    print(f"  페이지 {page} 수집 중...")
-                    
                     # 스크래핑
                     page_torrents = scraper.scrape_page(page=page, sort_by=sort_by, order=order, query=search_query, category=category)
                     

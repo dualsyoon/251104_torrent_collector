@@ -104,7 +104,6 @@ class SeleniumBaseScraper:
         # 1단계: cloudscraper 먼저 시도
         try:
             import cloudscraper
-            print(f"[{self.name}] Cloudscraper로 시도 중: {url}")
             scraper = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "mobile": False}
             )
@@ -115,17 +114,13 @@ class SeleniumBaseScraper:
             })
             response = scraper.get(url, timeout=25)
             if response.status_code == 200 and len(response.text) > 1000:
-                print(f"[{self.name}] OK Cloudscraper 성공 ({len(response.text)} bytes)")
                 return BeautifulSoup(response.text, 'lxml')
-            else:
-                print(f"[{self.name}] Cloudscraper 실패: status={response.status_code}, len={len(response.text)}")
         except ImportError:
-            print(f"[{self.name}] Cloudscraper 미설치 - Selenium으로 진행")
-        except Exception as e:
-            print(f"[{self.name}] Cloudscraper 오류: {e} - Selenium으로 진행")
+            pass  # Cloudscraper 미설치 시 Selenium으로 진행
+        except Exception:
+            pass  # Cloudscraper 오류 시 Selenium으로 진행
         
         # 2단계: Cloudscraper 실패 시 Selenium 사용
-        print(f"[{self.name}] Selenium으로 시도 중: {url}")
         # 재시도 로직 (네트워크 리셋 대비)
         last_exc = None
         for attempt in range(3):
@@ -195,7 +190,6 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
         # 페이지 간 딜레이
         if page > 1:
             delay = random.uniform(0.5, 1.5)
-            print(f"[{self.name}] 다음 페이지 요청 전 {delay:.1f}초 대기 중...")
             time.sleep(delay)
         
         # URL 구성
@@ -242,8 +236,6 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
         else:
             # tbody가 없으면 table에서 직접 tr 찾기
             rows = table.find_all('tr')
-        
-        print(f"[{self.name}] OK {len(rows)}개 토렌트 발견")
         
         # 첫 번째 행이 헤더일 수 있으므로 확인
         if rows and len(rows) > 0:
@@ -443,13 +435,9 @@ class SeleniumSukebeiScraper(SeleniumBaseScraper):
                     print(f"[{self.name}] 토렌트 파싱 오류 (행 {idx}): {e}")
                 continue
         
-        print(f"[{self.name}] 처리 완료: 총 {len(rows)}개 중 {processed_count}개 수집, {filtered_count}개 필터링, {no_magnet_count}개 마그넷 링크 없음")
-        
-        # 카테고리 통계 출력
-        if category_stats:
-            print(f"[{self.name}] 카테고리 통계:")
-            for cat, count in sorted(category_stats.items(), key=lambda x: x[1], reverse=True):
-                print(f"  - {cat}: {count}개")
+        # 간소화된 출력: 수집된 항목 수만 표시
+        if processed_count > 0:
+            print(f"[{self.name}] {processed_count}개 수집")
         
         return torrents
     

@@ -47,6 +47,12 @@ class ImageFinder:
         
         # JAVLibrary HTTP 차단 감지 플래그
         self.javlibrary_blocked = False  # HTTP 403이 발생하면 True로 설정
+        
+        # JAVBEE, JAVGURU HTTP 차단 감지 플래그
+        self.javbee_blocked = False  # HTTP 403이 연속 50회 발생하면 True로 설정
+        self.javbee_403_count = 0  # 연속 403 응답 카운트
+        self.javguru_blocked = False  # HTTP 403이 연속 50회 발생하면 True로 설정
+        self.javguru_403_count = 0  # 연속 403 응답 카운트
         self.http_timeout = max(3, int(qs.value('images/image_http_timeout', IMAGE_HTTP_TIMEOUT)))
         self.http_retries = max(0, int(qs.value('images/image_http_retries', IMAGE_HTTP_RETRIES)))
         # 공통 플레이스홀더/썸네일 차단 리스트
@@ -97,6 +103,23 @@ class ImageFinder:
             filtered: List[str] = []
             for u in urls:
                 if not u:
+                    continue
+                # GIF 파일 제외 (더 정확한 패턴)
+                u_lower = u.lower()
+                import re
+                is_gif = (
+                    u_lower.endswith('.gif') or
+                    u_lower.endswith('.gif?') or
+                    u_lower.endswith('.gif&') or
+                    u_lower.endswith('.gif#') or
+                    u_lower.endswith('.gif/') or
+                    '.gif?' in u_lower or
+                    '.gif&' in u_lower or
+                    '.gif#' in u_lower or
+                    '.gif/' in u_lower or
+                    re.search(r'\.gif[\?#&/]', u_lower) is not None
+                )
+                if is_gif:
                     continue
                 if self._is_blocked_thumbnail(u):
                     continue
@@ -207,7 +230,43 @@ class ImageFinder:
                             'snapshots': []
                         }
             
-            # 6) 최후의 수단: FC2PPV.stream (FC2 코드가 있을 때만)
+            # 6) Sukebei Nyaa 시도
+            if 'nyaa' not in exclude_servers:
+                for code in codes:
+                    urls = self._search_nyaa(code)
+                    image_urls.extend(urls)
+                    if len(image_urls) >= max_images:
+                        break
+                
+                # 결과가 있으면 바로 리턴
+                if image_urls:
+                    image_urls = _filter_urls(image_urls)
+                    if image_urls:
+                        print(f"[ImageFinder] Sukebei Nyaa 성공!")
+                        return {
+                            'thumbnail': image_urls[0],
+                            'snapshots': []
+                        }
+            
+            # 7) JAV.GURU 시도 (모든 형태의 제목 검색 가능)
+            if 'javguru' not in exclude_servers:
+                for code in codes:
+                    urls = self._search_javguru(code)
+                    image_urls.extend(urls)
+                    if len(image_urls) >= max_images:
+                        break
+                
+                # 결과가 있으면 바로 리턴
+                if image_urls:
+                    image_urls = _filter_urls(image_urls)
+                    if image_urls:
+                        print(f"[ImageFinder] JAV.GURU 성공!")
+                        return {
+                            'thumbnail': image_urls[0],
+                            'snapshots': []
+                        }
+            
+            # 8) 최후의 수단: FC2PPV.stream (FC2 코드가 있을 때만)
             if 'fc2ppv' not in exclude_servers and fc2_codes:
                 for fc2_code in fc2_codes:
                     urls = self._search_fc2ppv_stream(fc2_code)
@@ -262,7 +321,33 @@ class ImageFinder:
                     if image_urls:
                         break
         
-        # JAVBee 실패 시 FC2PPV.stream 시도 (FC2 코드가 있을 때만)
+        # JAVBee 실패 시 Sukebei Nyaa 시도 (모든 형태의 품번 검색 가능)
+        if 'nyaa' not in exclude_servers and not image_urls:
+            if codes:
+                for code in codes:
+                    urls = self._search_nyaa(code)
+                    image_urls.extend(urls)
+                    if image_urls:
+                        break
+            else:
+                # 코드가 없으면 전체 제목으로 검색
+                urls = self._search_nyaa(title)
+                image_urls.extend(urls)
+        
+        # Sukebei Nyaa 실패 시 JAV.GURU 시도 (모든 형태의 제목 검색 가능)
+        if 'javguru' not in exclude_servers and not image_urls:
+            if codes:
+                for code in codes:
+                    urls = self._search_javguru(code)
+                    image_urls.extend(urls)
+                    if image_urls:
+                        break
+            else:
+                # 코드가 없으면 전체 제목으로 검색
+                urls = self._search_javguru(title)
+                image_urls.extend(urls)
+        
+        # JAV.GURU 실패 시 FC2PPV.stream 시도 (FC2 코드가 있을 때만)
         if 'fc2ppv' not in exclude_servers and not image_urls and fc2_codes:
             for fc2_code in fc2_codes:
                 urls = self._search_fc2ppv_stream(fc2_code)
@@ -1014,24 +1099,37 @@ class ImageFinder:
                     session.get(base + "/", headers={"Referer": base + "/"}, timeout=20)
                     # 검색 요청
                     r = session.get(url, headers={"Referer": base + "/"}, timeout=25, allow_redirects=True)
-                    # 403 응답이면 재시도 (테스트 코드 로직)
+                    # 403 응답이면 연결을 처음부터 다시 시도
                     if r.status_code == 403:
+                        self.javdb_403_count += 1
+                        print(f"[ImageFinder] JAVDB 403 응답 ({self.javdb_403_count}/50): {base} - 연결을 처음부터 다시 시도")
+                        
+                        if self.javdb_403_count >= 50:
+                            print(f"[ImageFinder] JAVDB 403 차단 감지: 50번 연속 403 응답으로 인해 JAVDB 비활성화")
+                            self.javdb_available = False
+                            self.javdb_fail_count = 999  # 차단 상태 유지
+                            return []  # 50번 연속이면 차단
+                        
+                        # 세션 쿠키 초기화하고 처음부터 다시 시도
                         time.sleep(1.2)  # 403 발생 시 대기
-                        # 홈 워밍업 재시도
+                        session.cookies.clear()  # 쿠키 초기화
+                        
+                        # 쿠키 다시 설정
+                        for dom in [".javdb.com"]:
+                            try:
+                                session.cookies.set("over18", "1", domain=dom)
+                            except Exception:
+                                pass
+                        
+                        # 홈 워밍업 (처음부터)
                         session.get(base + "/", headers={"Referer": base + "/"}, timeout=20)
                         # 검색 요청 재시도
                         r = session.get(url, headers={"Referer": base + "/"}, timeout=25, allow_redirects=True)
-                        # 재시도 후에도 403이면 카운트 증가
+                        
+                        # 재시도 후에도 403이면 다음 미러로
                         if r.status_code == 403:
-                            self.javdb_403_count += 1
-                            print(f"[ImageFinder] JAVDB 403 응답 ({self.javdb_403_count}/10): {base} (재시도 후에도 실패)")
-                            if self.javdb_403_count >= 10:
-                                print(f"[ImageFinder] JAVDB 403 차단 감지: 10번 연속 403 응답으로 인해 JAVDB 비활성화")
-                                self.javdb_available = False
-                                self.javdb_fail_count = 999  # 차단 상태 유지
-                                return []  # 10번 연속이면 차단
-                            # 10번 미만이면 403 카운트만 증가하고 반환 (javdb_fail_count는 증가하지 않음)
-                            return []
+                            print(f"[ImageFinder] JAVDB 403 응답 ({self.javdb_403_count}/50): {base} (재시도 후에도 실패) - 다음 미러 시도")
+                            continue  # 다음 미러 도메인으로
                     
                     if r.status_code == 200 and len(r.text) > 1000:
                         html = r.text
@@ -1864,9 +1962,58 @@ class ImageFinder:
                 'Referer': 'https://javbee.vip/'
             }
             
-            response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
+            # 403 재시도 로직: 최대 3회 재시도 (서버 접속부터 다시)
+            max_retries = 3
+            response = None
+            for retry in range(max_retries):
+                response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
+                if not response:
+                    if retry < max_retries - 1:
+                        time.sleep(1.2)  # 재시도 전 대기
+                        continue
+                    return []
+                
+                # HTTP 403이면 카운트 증가 및 재시도 (서버 접속부터 다시)
+                if response.status_code == 403:
+                    self.javbee_403_count += 1
+                    print(f"[ImageFinder] JAVBee 403 응답 ({self.javbee_403_count}/50): {search_url} - 연결을 처음부터 다시 시도")
+                    
+                    if self.javbee_403_count >= 50:
+                        if not self.javbee_blocked:
+                            self.javbee_blocked = True
+                            print(f"[ImageFinder] JAVBee 403 차단 감지: 50번 연속 403 응답으로 인해 JAVBee 검색 비활성화")
+                        return []
+                    
+                    if retry < max_retries - 1:
+                        # 세션 쿠키 초기화하고 처음부터 다시 시도
+                        time.sleep(1.2)  # 403 발생 시 대기
+                        self.session.cookies.clear()  # 쿠키 초기화
+                        
+                        # 홈페이지 워밍업 (처음부터)
+                        try:
+                            self._safe_get("https://javbee.vip/", headers={'Referer': 'https://javbee.vip/'}, timeout=self.http_timeout)
+                        except Exception:
+                            pass
+                        
+                        continue  # 재시도
+                    else:
+                        return []  # 재시도 실패
+                
+                # 200 응답이면 403 카운트 리셋
+                if response.status_code == 200:
+                    if self.javbee_403_count > 0:
+                        self.javbee_403_count = 0  # 성공 시 403 카운트 리셋
+                    break  # 성공, 루프 종료
+                
+                # 403이 아닌 다른 오류
+                if retry < max_retries - 1:
+                    time.sleep(1.2)  # 재시도 전 대기
+                    continue
+                else:
+                    print(f"[ImageFinder] JAVBee 검색 페이지 접근 실패 (제목: {display_title}): {response.status_code}")
+                    return []
+            
             if not response or response.status_code != 200:
-                print(f"[ImageFinder] JAVBee 검색 페이지 접근 실패 (제목: {display_title}): {response.status_code if response else 'No response'}")
                 return []
             
             soup = BeautifulSoup(response.content, 'lxml')
@@ -2300,6 +2447,573 @@ class ImageFinder:
     # def _search_duckduckgo_images(self, query: str, max_results: int = 5) -> List[str]:
     #     """DuckDuckGo 이미지 검색 - 성인 컨텐츠 필터링으로 사용 불가"""
     #     return []
+    
+    def _search_nyaa(self, keyword: str) -> List[str]:
+        """Sukebei Nyaa에서 이미지 검색 (test_nya_cover_search.py 로직 기반)
+        
+        Args:
+            keyword: 검색 키워드 (작품번호 등)
+        """
+        try:
+            from urllib.parse import urlparse, urljoin as urljoin_parse
+            BASE_SEARCH = "https://sukebei.nyaa.si/"
+            MIN_BYTES = 10 * 1024  # 10KB
+            
+            # 자산 필터
+            ASSET_SEG_RE = re.compile(
+                r"(?:^|/)(?:logo|favicon|sprite|icons?|ads?|banners?|static|assets|themes|emoji|svg)(?:/|$)",
+                re.I
+            )
+            
+            def is_probably_asset(u: str) -> bool:
+                path = urlparse(u).path
+                return bool(ASSET_SEG_RE.search(path))
+            
+            def compile_keyword_strict(keyword: str):
+                """'문자+숫자'가 정확히 같고, 문자/숫자 사이의 '-' 만 옵션."""
+                m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", keyword.strip())
+                if not m:
+                    k = keyword.strip()
+                    k = re.escape(k).replace(r"\-", "-?")
+                    return re.compile(rf"(?<![A-Za-z0-9]){k}(?![A-Za-z0-9])", re.I)
+                prefix, num = m.groups()
+                return re.compile(
+                    rf"(?<![A-Za-z0-9]){re.escape(prefix)}-?{re.escape(num)}(?![A-Za-z0-9])",
+                    re.I,
+                )
+            
+            def build_search_url(keyword: str) -> str:
+                qs = urlencode({"f": 0, "c": "0_0", "q": keyword})
+                return f"{BASE_SEARCH}?{qs}"
+            
+            def find_first_result_and_title(soup: BeautifulSoup):
+                """검색 결과 테이블에서 가장 먼저 나오는 '/view/xxxx' 링크와 제목 텍스트를 찾음."""
+                a = soup.select_one("td a[href^='/view/'], a[href^='/view/']")
+                if not a:
+                    return None, None
+                title = (a.get_text(" ", strip=True) or "")[:500]
+                href = a.get("href")
+                if not href:
+                    return None, None
+                return urljoin_parse(BASE_SEARCH, href), title
+            
+            def find_description_nodes(soup: BeautifulSoup):
+                """상세 페이지에서 '설명'에 해당하는 컨테이너 후보들을 찾는다."""
+                nodes = []
+                nodes.extend(soup.select("#torrent-description, #description"))
+                for panel in soup.select(".panel"):
+                    header = panel.select_one(".panel-heading")
+                    if header and re.search(r"\bdescription\b", header.get_text(" ", strip=True), re.I):
+                        body = panel.select_one(".panel-body") or panel
+                        nodes.append(body)
+                if not nodes:
+                    nodes.extend(soup.select("article"))
+                if not nodes:
+                    nodes.extend(soup.select("div.content, .content, .container"))
+                seen, uniq = set(), []
+                for n in nodes:
+                    k = str(n)
+                    if k not in seen:
+                        uniq.append(n); seen.add(k)
+                return uniq[:3]
+            
+            # 1) 검색
+            search_url = build_search_url(keyword)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9,ko;q=0.8',
+                'Referer': BASE_SEARCH
+            }
+            
+            response = self._safe_get(search_url, headers=headers, timeout=self.http_timeout)
+            if not response or response.status_code != 200:
+                return []
+            
+            soup = BeautifulSoup(response.content, 'lxml')
+            view_url, title_text = find_first_result_and_title(soup)
+            
+            if not view_url or not title_text:
+                return []
+            
+            # 2) 제목 엄격 매칭
+            kw_re = compile_keyword_strict(keyword)
+            if not kw_re.search(title_text or ""):
+                return []
+            
+            # 3) 상세 페이지에서 이미지 추출
+            html = self._safe_get(view_url, headers=headers, timeout=self.http_timeout)
+            if not html or html.status_code != 200:
+                return []
+            
+            dsoup = BeautifulSoup(html.content, 'lxml')
+            nodes = find_description_nodes(dsoup)
+            if not nodes:
+                nodes = [dsoup]
+            
+            # 이미지 URL 수집
+            raw = []
+            def add_img_url(u, how):
+                if u:
+                    raw.append({"url": urljoin_parse(view_url, u), "how": how})
+            
+            for n in nodes:
+                for img in n.find_all("img"):
+                    add_img_url(img.get("src"), "img.src")
+                    add_img_url(img.get("data-src"), "img.data-src")
+                    add_img_url(img.get("data-original"), "img.data-original")
+                    srcset = img.get("srcset")
+                    if srcset:
+                        parts = [p.strip() for p in srcset.split(",") if p.strip()]
+                        for p in parts:
+                            add_img_url(p.split()[0], "img.srcset")
+            
+            # 마크다운 이미지 추출
+            MD_IMG_LINK_RE = re.compile(
+                r'\[!\[[^\]]*\]\((?P<img>https?://[^\s\)\]]+)\)\]\((?P<link>https?://[^\s\)\]]+)\)',
+                re.I
+            )
+            for m in MD_IMG_LINK_RE.finditer(html.text or ""):
+                img_url = m.group("img")
+                if img_url:
+                    add_img_url(img_url, "md.img")
+            
+            # 중복 제거 및 필터링
+            seen, results = set(), []
+            for it in raw:
+                u = it["url"]
+                if u in seen:
+                    continue
+                seen.add(u)
+                
+                # 자산 제외
+                if is_probably_asset(u):
+                    continue
+                
+                # GIF 파일 제외
+                u_lower = u.lower()
+                is_gif = (
+                    u_lower.endswith('.gif') or
+                    u_lower.endswith('.gif?') or
+                    u_lower.endswith('.gif&') or
+                    u_lower.endswith('.gif#') or
+                    u_lower.endswith('.gif/') or
+                    '.gif?' in u_lower or
+                    '.gif&' in u_lower or
+                    '.gif#' in u_lower or
+                    '.gif/' in u_lower or
+                    re.search(r'\.gif[\?#&/]', u_lower) is not None
+                )
+                if is_gif:
+                    continue
+                
+                # .html 제외
+                ext = pathlib.Path(urlparse(u).path).suffix.lower()
+                if ext == ".html" or ext == ".gif":
+                    continue
+                
+                # 간단한 이미지 검증 (HEAD 요청)
+                try:
+                    head_resp = self.session.head(u, headers=headers, allow_redirects=True, timeout=10)
+                    ct = (head_resp.headers.get("content-type") or "").lower()
+                    if not ct.startswith("image/"):
+                        continue
+                    # GIF content-type 제외
+                    if "gif" in ct:
+                        continue
+                    cl = head_resp.headers.get("content-length")
+                    size = int(cl) if cl and cl.isdigit() else None
+                    if size and size < MIN_BYTES:
+                        continue
+                    results.append(u)
+                except Exception:
+                    continue
+            
+            return results[:5]  # 최대 5개만 반환
+            
+        except Exception as e:
+            print(f"[ImageFinder] Sukebei Nyaa 검색 오류: {e}")
+            return []
+    
+    def _search_javguru(self, keyword: str) -> List[str]:
+        """JAV.GURU에서 이미지 검색 (test_javguru_cover_search.py 로직 기반)
+        
+        Args:
+            keyword: 검색 키워드 (작품번호 또는 제목)
+        """
+        try:
+            from urllib.parse import urlparse, urljoin as urljoin_parse, urlencode
+            BASE = "https://jav.guru"
+            MIN_BYTES = 10 * 1024  # 10KB
+            UA = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            
+            # 자산 필터
+            ASSET_SEG_RE = re.compile(
+                r"(?:^|/)(?:logo|favicon|sprite|icons?|ads?|banners?|static|themes|emoji|svg)(?:/|$)",
+                re.I
+            )
+            
+            def is_probably_asset(u: str) -> bool:
+                path = urlparse(u).path
+                return bool(ASSET_SEG_RE.search(path))
+            
+            def compile_keyword_strict(keyword: str):
+                """문자+숫자 정확 일치, 문자/숫자 사이 '-' 옵션."""
+                m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", keyword.strip())
+                if not m:
+                    k = keyword.strip()
+                    k = re.escape(k).replace(r"\-", "-?")
+                    return re.compile(rf"(?<![A-Za-z0-9]){k}(?![A-Za-z0-9])", re.I)
+                prefix, num = m.groups()
+                return re.compile(
+                    rf"(?<![A-Za-z0-9]){re.escape(prefix)}-?{re.escape(num)}(?![A-Za-z0-9])",
+                    re.I
+                )
+            
+            def ext_from_content_type(ct: str) -> str:
+                ct = (ct or "").lower()
+                if "jpeg" in ct:
+                    return ".jpg"
+                if "png" in ct:
+                    return ".png"
+                if "webp" in ct:
+                    return ".webp"
+                if "gif" in ct:
+                    return ".gif"
+                if "bmp" in ct:
+                    return ".bmp"
+                if "avif" in ct:
+                    return ".avif"
+                return ".jpg"
+            
+            def head_or_small_get(url: str, referer: str) -> dict:
+                """이미지 여부/크기 검사: HEAD → 실패 시 작은 GET"""
+                headers = {"User-Agent": UA, "Referer": referer}
+                try:
+                    r = self.session.head(url, headers=headers, allow_redirects=True, timeout=15)
+                    ct = (r.headers.get("content-type") or "").lower()
+                    cl = r.headers.get("content-length")
+                    size = int(cl) if cl and cl.isdigit() else None
+                    return {"ok": (ct.startswith("image/") if ct else False), "final_url": r.url, "ct": ct, "size": size}
+                except Exception:
+                    pass
+                try:
+                    with self.session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=25) as g:
+                        ct = (g.headers.get("content-type") or "").lower()
+                        cl = g.headers.get("content-length")
+                        size = int(cl) if cl and cl.isdigit() else None
+                        return {"ok": (ct.startswith("image/") if ct else False), "final_url": g.url, "ct": ct, "size": size}
+                except Exception:
+                    return {"ok": False, "final_url": url, "ct": "", "size": None}
+            
+            def find_first_card_and_title_from_search(soup: BeautifulSoup):
+                """검색 결과에서 첫 번째 카드(article)와 제목 텍스트 추출"""
+                for art in soup.select("article"):
+                    a = art.select_one("h2 a, h1 a, .entry-title a, a")
+                    if not a:
+                        continue
+                    title_txt = (a.get_text(" ", strip=True) or "").strip()
+                    if len(title_txt) >= 3:
+                        return art, title_txt
+                return None, None
+            
+            def collect_card_images(card_node, base_url: str) -> List[dict]:
+                """카드 내부 썸네일/커버 이미지 수집"""
+                cands: List[dict] = []
+                
+                def add(u: Optional[str], how: str):
+                    if not u:
+                        return
+                    if u.startswith("//"):
+                        u = "https:" + u
+                    cands.append({"url": urljoin_parse(base_url, u), "how": how})
+                
+                if getattr(card_node, "select", None):
+                    for img in card_node.select("img"):
+                        add(img.get("src"), "img.src")
+                        add(img.get("data-src"), "img.data-src")
+                        add(img.get("data-original"), "img.data-original")
+                        add(img.get("data-lazy-src"), "img.data-lazy-src")
+                        ss = img.get("srcset") or img.get("data-lazy-srcset")
+                        if ss:
+                            parts = [p.strip() for p in ss.split(",") if p.strip()]
+                            for p in reversed(parts):  # 큰 해상도 우선
+                                add(p.split()[0], "img.srcset")
+                    
+                    for cov in card_node.select(".post-thumbnail, .thumb, .cover, .image"):
+                        style = cov.get("style", "")
+                        m = re.search(r"url\((['\"]?)(.+?)\1\)", style)
+                        if m:
+                            add(m.group(2), "bg-style")
+                
+                # 중복 제거
+                uniq, seen = [], set()
+                for c in cands:
+                    if c["url"] not in seen:
+                        uniq.append(c)
+                        seen.add(c["url"])
+                return uniq
+            
+            def find_first_post_via_rest(keyword: str) -> tuple:
+                """WP REST 검색: /wp-json/wp/v2/search?search=<keyword>"""
+                api = f"{BASE}/wp-json/wp/v2/search?{urlencode({'search': keyword, 'per_page': 10})}"
+                try:
+                    r = self._safe_get(api, headers={"Referer": BASE + "/"}, timeout=20)
+                    if r and r.status_code == 200:
+                        data = r.json()
+                        for obj in data:
+                            link = obj.get("url") or obj.get("link")
+                            title = obj.get("title") or obj.get("title_plain") or ""
+                            if link and title:
+                                title_text = BeautifulSoup(str(title), "html.parser").get_text(" ", strip=True)
+                                return link, title_text
+                except Exception:
+                    pass
+                return None, None
+            
+            def find_first_post_via_rss(keyword: str) -> tuple:
+                """RSS 검색: /?s=<keyword>&feed=rss2"""
+                feed = f"{BASE}/?{urlencode({'s': keyword, 'feed': 'rss2'})}"
+                try:
+                    r = self._safe_get(feed, headers={"Referer": BASE + "/"}, timeout=20)
+                    if r and r.status_code == 200:
+                        soup = BeautifulSoup(r.text, "xml")
+                        item = soup.find("item")
+                        if item:
+                            link = item.findtext("link")
+                            title = item.findtext("title")
+                            return link, title
+                except Exception:
+                    pass
+                return None, None
+            
+            def collect_post_cover_images(post_html: str, base_url: str) -> List[dict]:
+                """포스트 페이지에서 대표 이미지 후보 수집"""
+                soup = BeautifulSoup(post_html, "lxml")
+                cands: List[dict] = []
+                
+                def add(u: Optional[str], how: str):
+                    if not u:
+                        return
+                    if u.startswith("//"):
+                        u = "https:" + u
+                    cands.append({"url": urljoin_parse(base_url, u), "how": how})
+                
+                # 1) 대표 이미지
+                for sel in ["img.wp-post-image", ".post-thumbnail img"]:
+                    tag = soup.select_one(sel)
+                    if tag:
+                        add(tag.get("src"), f"{sel}.src")
+                        add(tag.get("data-src"), f"{sel}.data-src")
+                
+                # 2) 본문 첫 이미지
+                first_img = soup.select_one(".entry-content img, article img")
+                if first_img:
+                    add(first_img.get("src"), "entry-first-img.src")
+                    add(first_img.get("data-src"), "entry-first-img.data-src")
+                
+                # 3) OG/Twitter
+                og = soup.find("meta", property="og:image")
+                if og and og.get("content"):
+                    add(og.get("content"), "meta.og:image")
+                
+                tw = soup.find("meta", attrs={"name": "twitter:image"})
+                if tw and tw.get("content"):
+                    add(tw.get("content"), "meta.twitter:image")
+                
+                # 중복 제거
+                uniq, seen = [], set()
+                for c in cands:
+                    if c["url"] and c["url"] not in seen:
+                        uniq.append(c)
+                        seen.add(c["url"])
+                return uniq
+            
+            # 1) 검색 페이지 시도
+            search_url = f"{BASE}/?{urlencode({'s': keyword})}"
+            headers = {
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+                "Referer": BASE + "/"
+            }
+            
+            # 403 재시도 로직: 최대 3회 재시도 (서버 접속부터 다시)
+            max_retries = 3
+            response = None
+            for retry in range(max_retries):
+                response = self._safe_get(search_url, headers=headers, timeout=25)
+                if not response:
+                    if retry < max_retries - 1:
+                        time.sleep(1.2)  # 재시도 전 대기
+                        continue
+                    return []
+                
+                # HTTP 403이면 카운트 증가 및 재시도 (서버 접속부터 다시)
+                if response.status_code == 403:
+                    self.javguru_403_count += 1
+                    print(f"[ImageFinder] JAVGURU 403 응답 ({self.javguru_403_count}/50): {search_url} - 연결을 처음부터 다시 시도")
+                    
+                    if self.javguru_403_count >= 50:
+                        if not self.javguru_blocked:
+                            self.javguru_blocked = True
+                            print(f"[ImageFinder] JAVGURU 403 차단 감지: 50번 연속 403 응답으로 인해 JAVGURU 검색 비활성화")
+                        return []
+                    
+                    if retry < max_retries - 1:
+                        # 세션 쿠키 초기화하고 처음부터 다시 시도
+                        time.sleep(1.2)  # 403 발생 시 대기
+                        self.session.cookies.clear()  # 쿠키 초기화
+                        
+                        # 홈페이지 워밍업 (처음부터)
+                        try:
+                            self._safe_get(BASE + "/", headers={"Referer": BASE + "/"}, timeout=25)
+                        except Exception:
+                            pass
+                        
+                        continue  # 재시도
+                    else:
+                        return []  # 재시도 실패
+                
+                # 200 응답이면 403 카운트 리셋
+                if response.status_code == 200:
+                    if self.javguru_403_count > 0:
+                        self.javguru_403_count = 0  # 성공 시 403 카운트 리셋
+                    break  # 성공, 루프 종료
+                
+                # 403이 아닌 다른 오류
+                if retry < max_retries - 1:
+                    time.sleep(1.2)  # 재시도 전 대기
+                    continue
+                else:
+                    return []
+            
+            if response and response.status_code == 200 and len(response.text) > 500:
+                soup = BeautifulSoup(response.text, "lxml")
+                card, title = find_first_card_and_title_from_search(soup)
+                
+                if card and title:
+                    kw_re = compile_keyword_strict(keyword)
+                    if kw_re.search(title):
+                        imgs = collect_card_images(card, BASE)
+                        if imgs:
+                            # 이미지 검증 및 필터링
+                            results = []
+                            for item in imgs[:10]:  # 최대 10개만 검증
+                                u = item["url"]
+                                
+                                # 자산 제외
+                                if is_probably_asset(u):
+                                    continue
+                                
+                                # GIF 파일 제외
+                                u_lower = u.lower()
+                                is_gif = (
+                                    u_lower.endswith('.gif') or
+                                    u_lower.endswith('.gif?') or
+                                    u_lower.endswith('.gif&') or
+                                    u_lower.endswith('.gif#') or
+                                    u_lower.endswith('.gif/') or
+                                    '.gif?' in u_lower or
+                                    '.gif&' in u_lower or
+                                    '.gif#' in u_lower or
+                                    '.gif/' in u_lower or
+                                    re.search(r'\.gif[\?#&/]', u_lower) is not None
+                                )
+                                if is_gif:
+                                    continue
+                                
+                                # 이미지 검증
+                                probe = head_or_small_get(u, search_url)
+                                size_ok = (probe["size"] is None) or (probe["size"] >= MIN_BYTES)
+                                if not probe["ok"] and pathlib.Path(urlparse(u).path).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".avif"}:
+                                    continue
+                                if not size_ok:
+                                    continue
+                                
+                                # GIF content-type 제외
+                                if probe["ct"] and "gif" in probe["ct"].lower():
+                                    continue
+                                
+                                results.append(probe["final_url"] or u)
+                                if len(results) >= 5:
+                                    break
+                            
+                            if results:
+                                return results
+            
+            # 2) 폴백: WP REST → RSS
+            post_url, post_title = find_first_post_via_rest(keyword)
+            if not post_url:
+                post_url, post_title = find_first_post_via_rss(keyword)
+            
+            if not post_url or not post_title:
+                return []
+            
+            # 제목 엄격 매칭
+            kw_re = compile_keyword_strict(keyword)
+            if not kw_re.search(post_title or ""):
+                return []
+            
+            # 포스트 페이지에서 대표 이미지 수집
+            pr = self._safe_get(post_url, headers=headers, timeout=25)
+            if not pr or pr.status_code != 200:
+                return []
+            
+            post_imgs = collect_post_cover_images(pr.text, post_url)
+            if not post_imgs:
+                return []
+            
+            # 이미지 검증 및 필터링
+            results = []
+            for item in post_imgs[:10]:  # 최대 10개만 검증
+                u = item["url"]
+                
+                # 자산 제외
+                if is_probably_asset(u):
+                    continue
+                
+                # GIF 파일 제외
+                u_lower = u.lower()
+                is_gif = (
+                    u_lower.endswith('.gif') or
+                    u_lower.endswith('.gif?') or
+                    u_lower.endswith('.gif&') or
+                    u_lower.endswith('.gif#') or
+                    u_lower.endswith('.gif/') or
+                    '.gif?' in u_lower or
+                    '.gif&' in u_lower or
+                    '.gif#' in u_lower or
+                    '.gif/' in u_lower or
+                    re.search(r'\.gif[\?#&/]', u_lower) is not None
+                )
+                if is_gif:
+                    continue
+                
+                # 이미지 검증
+                probe = head_or_small_get(u, post_url)
+                size_ok = (probe["size"] is None) or (probe["size"] >= MIN_BYTES)
+                if not probe["ok"] and pathlib.Path(urlparse(u).path).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".avif"}:
+                    continue
+                if not size_ok:
+                    continue
+                
+                # GIF content-type 제외
+                if probe["ct"] and "gif" in probe["ct"].lower():
+                    continue
+                
+                results.append(probe["final_url"] or u)
+                if len(results) >= 5:
+                    break
+            
+            return results
+            
+        except Exception as e:
+            print(f"[ImageFinder] JAV.GURU 검색 오류: {e}")
+            return []
     
     def _clean_query(self, title: str) -> str:
         """검색어 정제

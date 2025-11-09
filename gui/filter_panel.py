@@ -14,6 +14,8 @@ class FilterPanel(QWidget):
     
     # 필터 변경 시그널
     filter_changed = Signal(dict)
+    # 썸네일 검색 서버 초기화 요청 시그널
+    reset_searched_servers_requested = Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -72,6 +74,11 @@ class FilterPanel(QWidget):
         reset_btn = QPushButton("🔄 필터 초기화")
         reset_btn.clicked.connect(self.reset_filters)
         layout.addWidget(reset_btn)
+        
+        # 썸네일 검색 서버 초기화 버튼
+        reset_searched_servers_btn = QPushButton("🔄 썸네일 검색 서버 초기화")
+        reset_searched_servers_btn.clicked.connect(self.reset_searched_servers_requested)
+        layout.addWidget(reset_searched_servers_btn)
         
         layout.addStretch()
     

@@ -3,7 +3,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QLabel, QPushButton, QHeaderView, QMessageBox, QAbstractItemView
 )
-from PySide6.QtCore import Qt, Signal, QUrl, QSize, QSettings, QEvent
+from PySide6.QtCore import Qt, Signal, QUrl, QSize, QSettings, QEvent, QTimer
+import time
 from PySide6.QtGui import QDesktopServices, QPixmap, QIcon, QCursor
 from typing import List, Dict, Optional
 from database.models import Torrent
@@ -34,9 +35,13 @@ class TorrentListWidget(QWidget):
         self.image_cache = ImageCache(max_cache=IMAGE_CACHE_SIZE)
         self.image_downloader = ImageDownloader(self.image_cache)
         self.image_downloader.image_loaded.connect(self._on_image_loaded)
+        self.image_downloader.download_failed.connect(self._on_image_failed)
         
         # 이미지 URL -> 행 번호 매핑 (썸네일)
         self.url_to_rows: Dict[str, List[int]] = {}
+        # 행별 로딩 시작 시간 및 타임아웃 타이머 추적
+        self.row_loading_start_time: Dict[int, float] = {}  # row -> start_time
+        self.row_timeout_timers: Dict[int, 'QTimer'] = {}  # row -> QTimer
         # 스냅샷 비활성화
         # 행 -> 원본 Pixmap 매핑 (호버 미리보기용)
         self.row_to_pixmap: Dict[int, QPixmap] = {}
@@ -187,130 +192,176 @@ class TorrentListWidget(QWidget):
         # 현재 호버 중인 행 리셋
         self.current_hover_row = None
         
-        # 이전 페이지의 진행 중인 이미지 다운로드 취소
-        self.image_downloader.cancel_all()
-        
-        self.torrents = torrents
-        self.info_label.setText(f"토렌트 {len(torrents)}개")
-        
-        # URL 매핑 및 pixmap 캐시 초기화
-        self.url_to_rows.clear()
-        self.row_to_pixmap.clear()  # 이전 페이지 썸네일 캐시 제거
-        # 스냅샷 비활성화
-        
-        self.table.setRowCount(len(torrents))
-        
-        # 행 높이 설정 (썸네일 표시를 위해 더 크게)
-        self.table.verticalHeader().setDefaultSectionSize(self.row_height)
-        
-        for row, torrent in enumerate(torrents):
-            # 썸네일 (컬럼 0)
-            thumbnail_item = QTableWidgetItem()
-            thumbnail_item.setTextAlignment(Qt.AlignCenter)
-            # 로딩 중 표시
-            if torrent.thumbnail_url:
-                thumbnail_item.setText("로딩중...")
-            else:
-                thumbnail_item.setText("이미지 없음")
-            self.table.setItem(row, 0, thumbnail_item)
+        # 이전 페이지의 진행 중인 이미지 다운로드 취소 (비동기로 처리하여 UI 블로킹 방지)
+        def cleanup_async():
+            self.image_downloader.cancel_all()
             
-            # 썸네일은 lazy loading으로 처리 (set_torrents 후 _load_visible_images에서 처리)
+            # 이전 페이지의 타임아웃 타이머 모두 정리
+            for row in list(self.row_timeout_timers.keys()):
+                self._clear_row_timeout(row)
+            self.row_loading_start_time.clear()
+        
+        # 비동기로 정리 작업 실행
+        QTimer.singleShot(0, cleanup_async)
+        
+        # 테이블 설정도 비동기로 처리하여 UI 블로킹 방지
+        def setup_table_async():
+            self.torrents = torrents
             
-            # 스냅샷 비활성화: 컬럼 없음
+            # UI 업데이트를 더 작은 단위로 나눠서 처리
+            def update_info_label():
+                self.info_label.setText(f"토렌트 {len(torrents)}개")
+            
+            def update_table_structure():
+                # URL 매핑 및 pixmap 캐시 초기화
+                self.url_to_rows.clear()
+                self.row_to_pixmap.clear()  # 이전 페이지 썸네일 캐시 제거
+                # 스냅샷 비활성화
+                
+                self.table.setRowCount(len(torrents))
+                
+                # 행 높이 설정 (썸네일 표시를 위해 더 크게)
+                self.table.verticalHeader().setDefaultSectionSize(self.row_height)
+                
+                # 테이블 행 설정 시작
+                setup_row_batch(0, batch_size=1)
+            
+            # 순차적으로 비동기 실행
+            QTimer.singleShot(0, update_info_label)
+            QTimer.singleShot(0, update_table_structure)
+        
+        # 비동기로 테이블 설정 실행
+        QTimer.singleShot(0, setup_table_async)
+        
+        # 테이블 행 설정을 배치로 나눠서 처리 (UI 블로킹 방지)
+        def setup_row_batch(start_idx: int, batch_size: int = 1):
+            """배치 단위로 행 설정 (UI 블로킹 방지)"""
+            end_idx = min(start_idx + batch_size, len(torrents))
+            
+            for row in range(start_idx, end_idx):
+                torrent = torrents[row]
+                # 썸네일 (컬럼 0)
+                thumbnail_item = QTableWidgetItem()
+                thumbnail_item.setTextAlignment(Qt.AlignCenter)
+                # 로딩 중 표시
+                if torrent.thumbnail_url:
+                    thumbnail_item.setText("로딩중...")
+                else:
+                    thumbnail_item.setText("이미지 없음")
+                self.table.setItem(row, 0, thumbnail_item)
+                
+                # 썸네일은 lazy loading으로 처리 (set_torrents 후 _load_visible_images에서 처리)
+                
+                # 스냅샷 비활성화: 컬럼 없음
 
-            # 제목 (컬럼 1) - 텍스트 드래그 복사 가능하도록 QLabel 사용
-            title_label = QLabel(torrent.title)
-            title_label.setToolTip(torrent.title)
-            title_label.setWordWrap(True)
-            title_label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-            title_label.setStyleSheet("QLabel { background-color: transparent; padding: 5px; }")
-            self.table.setCellWidget(row, 1, title_label)
-            # 정렬을 위한 빈 아이템 (텍스트는 비우고 데이터만 설정)
-            sort_item = QTableWidgetItem()
-            sort_item.setData(Qt.DisplayRole, torrent.title)  # 정렬용 데이터
-            sort_item.setText("")  # 표시 텍스트는 비움
-            self.table.setItem(row, 1, sort_item)
+                # 제목 (컬럼 1) - 텍스트 드래그 복사 가능하도록 QLabel 사용
+                title_label = QLabel(torrent.title)
+                title_label.setToolTip(torrent.title)
+                title_label.setWordWrap(True)
+                title_label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+                title_label.setStyleSheet("QLabel { background-color: transparent; padding: 5px; }")
+                self.table.setCellWidget(row, 1, title_label)
+                # 정렬을 위한 빈 아이템 (텍스트는 비우고 데이터만 설정)
+                sort_item = QTableWidgetItem()
+                sort_item.setData(Qt.DisplayRole, torrent.title)  # 정렬용 데이터
+                sort_item.setText("")  # 표시 텍스트는 비움
+                self.table.setItem(row, 1, sort_item)
+                
+                # 크기
+                size_item = QTableWidgetItem(torrent.size or 'N/A')
+                size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(row, 2, size_item)
+                
+                # 시더
+                seeders = torrent.seeders or 0
+                seeders_item = QTableWidgetItem()
+                seeders_item.setData(Qt.DisplayRole, seeders)  # 숫자로 정렬
+                seeders_item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, 3, seeders_item)
+                
+                # 리처
+                leechers = torrent.leechers or 0
+                leechers_item = QTableWidgetItem()
+                leechers_item.setData(Qt.DisplayRole, leechers)  # 숫자로 정렬
+                leechers_item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, 4, leechers_item)
+                
+                # 다운로드수
+                downloads = torrent.downloads or 0
+                downloads_item = QTableWidgetItem()
+                downloads_item.setData(Qt.DisplayRole, downloads)  # 숫자로 정렬
+                downloads_item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, 5, downloads_item)
+                
+                # 날짜
+                date_str = torrent.upload_date.strftime('%Y-%m-%d') if torrent.upload_date else 'N/A'
+                date_item = QTableWidgetItem(date_str)
+                date_item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, 6, date_item)
+                
+                # 교체 버튼 (맨 오른쪽)
+                replace_btn = QPushButton("썸네일 교체")
+                replace_btn.setToolTip("이 썸네일을 다른 소스에서 다시 검색합니다")
+                # 포커스 정책: 클릭해도 포커스를 받지 않음 (스크롤 이동 방지)
+                replace_btn.setFocusPolicy(Qt.NoFocus)
+                # 버튼 스타일 설정 (배경색을 조금 다르게)
+                replace_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #4A90E2;
+                        color: white;
+                        border: 1px solid #357ABD;
+                        border-radius: 3px;
+                        padding: 4px 8px;
+                        font-size: 11px;
+                    }
+                    QPushButton:hover {
+                        background-color: #5A9FF2;
+                    }
+                    QPushButton:pressed {
+                        background-color: #3A80D2;
+                    }
+                    QPushButton:disabled {
+                        background-color: #CCCCCC;
+                        color: #666666;
+                    }
+                """)
+                # 클릭 핸들러: 현재 토렌트 ID 전달
+                replace_btn.clicked.connect(lambda _, tid=torrent.id: self._on_replace_clicked(tid))
+                self.table.setCellWidget(row, 7, replace_btn)
             
-            # 크기
-            size_item = QTableWidgetItem(torrent.size or 'N/A')
-            size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.table.setItem(row, 2, size_item)
-            
-            # 시더
-            seeders = torrent.seeders or 0
-            seeders_item = QTableWidgetItem()
-            seeders_item.setData(Qt.DisplayRole, seeders)  # 숫자로 정렬
-            seeders_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 3, seeders_item)
-            
-            # 리처
-            leechers = torrent.leechers or 0
-            leechers_item = QTableWidgetItem()
-            leechers_item.setData(Qt.DisplayRole, leechers)  # 숫자로 정렬
-            leechers_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 4, leechers_item)
-            
-            # 다운로드수
-            downloads = torrent.downloads or 0
-            downloads_item = QTableWidgetItem()
-            downloads_item.setData(Qt.DisplayRole, downloads)  # 숫자로 정렬
-            downloads_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 5, downloads_item)
-            
-            # 날짜
-            date_str = torrent.upload_date.strftime('%Y-%m-%d') if torrent.upload_date else 'N/A'
-            date_item = QTableWidgetItem(date_str)
-            date_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 6, date_item)
-            
-            # 교체 버튼 (맨 오른쪽)
-            replace_btn = QPushButton("썸네일 교체")
-            replace_btn.setToolTip("이 썸네일을 다른 소스에서 다시 검색합니다")
-            # 포커스 정책: 클릭해도 포커스를 받지 않음 (스크롤 이동 방지)
-            replace_btn.setFocusPolicy(Qt.NoFocus)
-            # 버튼 스타일 설정 (배경색을 조금 다르게)
-            replace_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #4A90E2;
-                    color: white;
-                    border: 1px solid #357ABD;
-                    border-radius: 3px;
-                    padding: 4px 8px;
-                    font-size: 11px;
-                }
-                QPushButton:hover {
-                    background-color: #5A9FF2;
-                }
-                QPushButton:pressed {
-                    background-color: #3A80D2;
-                }
-                QPushButton:disabled {
-                    background-color: #CCCCCC;
-                    color: #666666;
-                }
-            """)
-            # 클릭 핸들러: 현재 토렌트 ID 전달
-            replace_btn.clicked.connect(lambda _, tid=torrent.id: self._on_replace_clicked(tid))
-            self.table.setCellWidget(row, 7, replace_btn)
-        
-        # 보이는 행의 이미지 로딩
-        self._load_all_images()
+            # 다음 배치 처리 (클로저 문제 방지를 위해 end_idx를 명시적으로 전달)
+            if end_idx < len(torrents):
+                def next_batch():
+                    setup_row_batch(end_idx, batch_size)
+                QTimer.singleShot(5, next_batch)  # 5ms 후 다음 배치
+            else:
+                # 모든 행 설정 완료 후 이미지 로딩 시작
+                QTimer.singleShot(0, self._load_all_images)
 
     def _on_replace_clicked(self, torrent_id: int):
         """행의 교체 버튼 클릭 시그널 처리"""
         try:
-            # torrent_id로 행 찾아서 버튼 즉시 비활성화
-            for row, torrent in enumerate(self.torrents):
-                if torrent.id == torrent_id:
-                    btn = self.table.cellWidget(row, 7)
-                    if btn and isinstance(btn, QPushButton):
-                        btn.setEnabled(False)
-                        btn.setText("검색중...")
-                    break
+            # 버튼 상태 변경을 비동기로 처리하여 UI 블로킹 방지
+            def update_button_async():
+                try:
+                    # torrent_id로 행 찾아서 버튼 비활성화
+                    for row, torrent in enumerate(self.torrents):
+                        if torrent.id == torrent_id:
+                            btn = self.table.cellWidget(row, 7)
+                            if btn and isinstance(btn, QPushButton):
+                                btn.setEnabled(False)
+                                btn.setText("검색중...")
+                            break
+                except Exception as e:
+                    print(f"[교체] 버튼 상태 변경 오류: {e}")
             
-            self.replace_thumbnail_requested.emit(torrent_id)
+            # 버튼 상태 변경을 즉시 실행 (다음 이벤트 루프에서)
+            QTimer.singleShot(0, update_button_async)
+            
+            # 시그널 발생도 비동기로 처리하여 UI 블로킹 방지
+            QTimer.singleShot(0, lambda: self.replace_thumbnail_requested.emit(torrent_id))
         except Exception as e:
-            print(f"[교체] 버튼 상태 변경 오류: {e}")
+            print(f"[교체] 버튼 클릭 처리 오류: {e}")
     
     def enable_replace_button(self, torrent_id: int):
         """교체 완료/실패 후 버튼 재활성화"""
@@ -391,7 +442,22 @@ class TorrentListWidget(QWidget):
         cached = self.image_cache.get(url)
         if cached:
             self._set_thumbnail(row, cached)
+            # 타임아웃 타이머 정리
+            self._clear_row_timeout(row)
             return
+        
+        # 로딩 시작 시간 기록
+        self.row_loading_start_time[row] = time.time()
+        
+        # 기존 타임아웃 타이머가 있으면 제거
+        self._clear_row_timeout(row)
+        
+        # 5초 타임아웃 타이머 설정
+        timeout_timer = QTimer()
+        timeout_timer.setSingleShot(True)
+        timeout_timer.timeout.connect(lambda: self._on_loading_timeout(row, url))
+        timeout_timer.start(5000)  # 5초
+        self.row_timeout_timers[row] = timeout_timer
         
         # 다운로드 시작 (비동기)
         self.image_downloader.download(url)
@@ -447,6 +513,12 @@ class TorrentListWidget(QWidget):
         
         if url in self.url_to_rows:
             for row in self.url_to_rows[url]:
+                # 타임아웃 타이머 정리
+                self._clear_row_timeout(row)
+                # 로딩 시작 시간 제거
+                if row in self.row_loading_start_time:
+                    del self.row_loading_start_time[row]
+                
                 # 원본 pixmap 저장 (호버 미리보기용) - 유효한 이미지만
                 self.row_to_pixmap[row] = pixmap
                 self._set_thumbnail(row, pixmap)
@@ -455,6 +527,68 @@ class TorrentListWidget(QWidget):
                 if self.enable_hover_preview and row == self.current_hover_row:
                     self._show_preview(pixmap)
         # else: URL이 url_to_rows에 없는 경우는 페이지 변경이나 썸네일 업데이트로 인한 정상적인 상황일 수 있으므로 조용히 무시
+    
+    def _on_image_failed(self, url: str):
+        """이미지 다운로드 실패 시그널 처리
+        
+        Args:
+            url: 실패한 이미지 URL
+        """
+        if url in self.url_to_rows:
+            for row in self.url_to_rows[url]:
+                # 타임아웃 타이머 정리
+                self._clear_row_timeout(row)
+                # 로딩 시작 시간 제거
+                if row in self.row_loading_start_time:
+                    del self.row_loading_start_time[row]
+                
+                # 다른 서버에서 썸네일 검색 요청 (비동기로 처리하여 UI 블로킹 방지)
+                QTimer.singleShot(0, lambda r=row: self._request_thumbnail_search(r))
+    
+    def _on_loading_timeout(self, row: int, url: str):
+        """이미지 로딩 타임아웃 처리 (5초)
+        
+        Args:
+            row: 행 번호
+            url: 타임아웃된 이미지 URL
+        """
+        # 타임아웃 타이머 정리
+        self._clear_row_timeout(row)
+        # 로딩 시작 시간 제거
+        if row in self.row_loading_start_time:
+            del self.row_loading_start_time[row]
+        
+        # 로딩 중 텍스트를 "타임아웃"으로 변경
+        thumbnail_item = self.table.item(row, 0)
+        if thumbnail_item:
+            thumbnail_item.setText("타임아웃")
+        
+        # 다른 서버에서 썸네일 검색 요청 (비동기로 처리하여 UI 블로킹 방지)
+        QTimer.singleShot(0, lambda: self._request_thumbnail_search(row))
+    
+    def _request_thumbnail_search(self, row: int):
+        """다른 서버에서 썸네일 검색 요청
+        
+        Args:
+            row: 행 번호
+        """
+        if 0 <= row < len(self.torrents):
+            torrent = self.torrents[row]
+            # replace_thumbnail_requested 시그널 발생 (비동기로 처리)
+            QTimer.singleShot(0, lambda: self.replace_thumbnail_requested.emit(torrent.id))
+    
+    def _clear_row_timeout(self, row: int):
+        """행의 타임아웃 타이머 정리
+        
+        Args:
+            row: 행 번호
+        """
+        if row in self.row_timeout_timers:
+            timer = self.row_timeout_timers[row]
+            if timer:
+                timer.stop()
+                timer.deleteLater()
+            del self.row_timeout_timers[row]
     
     def _load_visible_images(self):
         """보이는 행의 이미지만 로딩 (lazy loading)"""
@@ -496,17 +630,36 @@ class TorrentListWidget(QWidget):
         self._load_visible_images()
 
     def _load_all_images(self):
-        """현재 페이지의 모든 행 이미지를 메모리에 선로딩"""
+        """현재 페이지의 모든 행 이미지를 메모리에 선로딩 (비동기 처리)"""
         if not self.torrents:
             return
-        for row, torrent in enumerate(self.torrents):
-            if torrent.thumbnail_url:
-                cached = self.image_cache.get(torrent.thumbnail_url)
-                if not cached:
-                    self._load_thumbnail(row, torrent.thumbnail_url)
-                else:
-                    self._set_thumbnail(row, cached)
-            self._load_snapshots_for_row(row, torrent)
+        
+        # 배치 처리: 한 번에 처리할 행 수 제한하여 UI 반응성 유지
+        from PySide6.QtCore import QTimer
+        
+        def process_batch(start_idx: int, batch_size: int = 5):
+            """배치 단위로 이미지 로드 (UI 블로킹 방지)"""
+            end_idx = min(start_idx + batch_size, len(self.torrents))
+            
+            for row in range(start_idx, end_idx):
+                if row < len(self.torrents):
+                    torrent = self.torrents[row]
+                    if torrent.thumbnail_url:
+                        cached = self.image_cache.get(torrent.thumbnail_url)
+                        if not cached:
+                            self._load_thumbnail(row, torrent.thumbnail_url)
+                        else:
+                            self._set_thumbnail(row, cached)
+                    self._load_snapshots_for_row(row, torrent)
+            
+            # 다음 배치 처리 (클로저 문제 방지를 위해 end_idx를 명시적으로 전달)
+            if end_idx < len(self.torrents):
+                def next_batch():
+                    process_batch(end_idx, batch_size)
+                QTimer.singleShot(10, next_batch)  # 10ms 후 다음 배치
+        
+        # 첫 배치 시작
+        process_batch(0, batch_size=5)
 
     def _load_snapshots_for_row(self, row: int, torrent: Torrent):
         """주어진 행의 스냅샷 이미지를 선로딩"""
