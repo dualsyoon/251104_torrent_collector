@@ -253,9 +253,13 @@ class Database:
             for genre_name in genres:
                 query = query.join(Torrent.genres).filter(Genre.name == genre_name)
         
-        # 검색어 필터
+        # 검색어 필터 (띄어쓰기가 있으면 AND 조건으로 검색)
         if search_query:
-            query = query.filter(Torrent.title.contains(search_query))
+            # 띄어쓰기로 분리하여 각 단어가 모두 포함되는지 확인
+            search_words = [word.strip() for word in search_query.split() if word.strip()]
+            if search_words:
+                for word in search_words:
+                    query = query.filter(Torrent.title.contains(word))
         
         # 정렬 (파라미터에 따라)
         # size 필드 정렬 시 size_bytes를 사용 (단위 고려)
@@ -303,9 +307,13 @@ class Database:
         if country and country != 'ALL':
             query = query.filter(Torrent.country == country)
         
-        # 검색어 필터
+        # 검색어 필터 (띄어쓰기가 있으면 AND 조건으로 검색)
         if search_query:
-            query = query.filter(Torrent.title.contains(search_query))
+            # 띄어쓰기로 분리하여 각 단어가 모두 포함되는지 확인
+            search_words = [word.strip() for word in search_query.split() if word.strip()]
+            if search_words:
+                for word in search_words:
+                    query = query.filter(Torrent.title.contains(word))
         
         return query.count()
     

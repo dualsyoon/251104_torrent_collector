@@ -483,16 +483,23 @@ class ThumbnailUpdateThread(QThread):
                                     is_fc2 = True
                                     break
                         
-                        # FC2 항목: FC2PPV, JAVDB, NYAA만 처리 가능
-                        # FC2가 아닌 항목: JAVDB, JAVBEE, NYAA만 처리 가능
-                        # NYAA는 모든 형태의 품번 검색 가능
+                        # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST만 처리 가능
+                        # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST만 처리 가능
+                        # JAVGURU, JAVMOST는 모든 형태의 제목 검색 가능
                         if is_fc2:
-                            all_servers = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                            all_servers = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                         else:
-                            all_servers = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                            all_servers = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                         
                         # 모든 서버에서 검색했으면 스킵
-                        if set(searched_servers) == all_servers:
+                        # searched_servers를 set으로 변환하여 비교 (대소문자 구분 없이)
+                        searched_servers_set = {s.lower() for s in searched_servers} if searched_servers else set()
+                        all_servers_lower = {s.lower() for s in all_servers}
+                        
+                        # 미검색 서버 확인
+                        remaining_servers = all_servers_lower - searched_servers_set
+                        
+                        if not remaining_servers:
                             # 모든 서버에서 검색했는데 썸네일이 없으면 이미지 없음 처리
                             if not torrent.thumbnail_url:
                                 if self.db_writer:
@@ -684,7 +691,6 @@ class ThumbnailUpdateThread(QThread):
                         # JAVDB는 FC2 항목도 처리 가능
                         if codes:
                             for code in codes:
-                                print(f"[{server.upper()}] 코드로 검색 시도: {code} (제목: {title[:50]}...)")
                                 urls = finder._search_javdb(code)
                                 image_urls.extend(urls)
                                 if image_urls:
@@ -906,13 +912,13 @@ class ThumbnailUpdateThread(QThread):
                             title_text = temp_item.get('title', '') or torrent.title or ''
                             is_fc2 = is_fc2_title(title_text)
                             
-                            # FC2 항목: FC2PPV, JAVDB, NYAA만 처리 가능
-                            # FC2가 아닌 항목: JAVDB, JAVBEE, NYAA만 처리 가능
-                            # NYAA는 모든 형태의 품번 검색 가능
+                            # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST만 처리 가능
+                            # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST만 처리 가능
+                            # JAVGURU, JAVMOST는 모든 형태의 제목 검색 가능
                             if is_fc2:
-                                all_servers = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                all_servers = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                             else:
-                                all_servers = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                all_servers = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                             
                             # 이미 이 서버에서 탐색했으면 다른 서버 확인
                             if server_name in searched_servers:
@@ -1106,6 +1112,16 @@ class ThumbnailUpdateThread(QThread):
                                                     found_count += 1
                                             elif server_name == 'fc2ppv' and is_fc2:
                                                 # FC2PPV는 FC2 항목만 처리 가능
+                                                if put_to_server_queue(server_name, temp_item):
+                                                    entry['processed'] = True
+                                                    found_count += 1
+                                            elif server_name == 'javguru':
+                                                # JAVGURU는 모든 형태의 제목 검색 가능
+                                                if put_to_server_queue(server_name, temp_item):
+                                                    entry['processed'] = True
+                                                    found_count += 1
+                                            elif server_name == 'javmost':
+                                                # JAVMOST는 모든 형태의 제목 검색 가능
                                                 if put_to_server_queue(server_name, temp_item):
                                                     entry['processed'] = True
                                                     found_count += 1
@@ -1425,6 +1441,9 @@ class ThumbnailUpdateThread(QThread):
                                 
                                 # 우선순위 리스트에서 항목 찾기
                                 with priority_lock:
+                                    # 주기적으로 processed 항목 제거 (100개 이상일 때만, 성능 최적화)
+                                    if len(priority_list) > 100:
+                                        priority_list[:] = [x for x in priority_list if not x['processed']]
                                     unprocessed_priority = [x for x in priority_list if not x['processed']]
                                     for entry in unprocessed_priority[:]:  # 복사본으로 순회
                                         temp_item = entry['item']
@@ -1748,6 +1767,18 @@ class ThumbnailUpdateThread(QThread):
                                                 entry['processed'] = True
                                                 used_queue = 'main_list'
                                                 break
+                                            elif server_name == 'javguru':
+                                                # JAVGURU는 모든 형태의 제목 검색 가능
+                                                item = temp_item
+                                                entry['processed'] = True
+                                                used_queue = 'main_list'
+                                                break
+                                            elif server_name == 'javmost':
+                                                # JAVMOST는 모든 형태의 제목 검색 가능
+                                                item = temp_item
+                                                entry['processed'] = True
+                                                used_queue = 'main_list'
+                                                break
                                             # 현재 서버에서 처리 불가하면 마킹하지 않고 다음 항목 확인 (다른 서버가 처리할 수 있음)
                                             continue
                                 
@@ -1828,6 +1859,16 @@ class ThumbnailUpdateThread(QThread):
                                                         # FC2가 아닌 항목은 FC2PPV가 처리 불가
                                                         # 다시 큐에 넣기
                                                         source_queue.put(temp_item)
+                                                elif server_name == 'javguru':
+                                                    # JAVGURU는 모든 형태의 제목 검색 가능
+                                                    item = temp_item
+                                                    used_queue = source_queue
+                                                    break  # 항목을 찾았으면 중단
+                                                elif server_name == 'javmost':
+                                                    # JAVMOST는 모든 형태의 제목 검색 가능
+                                                    item = temp_item
+                                                    used_queue = source_queue
+                                                    break  # 항목을 찾았으면 중단
                                                 else:
                                                     # 알 수 없는 서버 - 다시 큐에 넣기
                                                     source_queue.put(temp_item)
@@ -1877,6 +1918,24 @@ class ThumbnailUpdateThread(QThread):
                                                 # JAVDB는 FC2 항목도 처리 가능
                                                 if server_name == 'javdb':
                                                     # JAVDB는 모든 항목 처리 가능
+                                                    item = temp_item
+                                                    entry['processed'] = True
+                                                    used_queue = 'priority_list'
+                                                    if item:
+                                                        priority_mark = "[우선순위] " if item.get('is_priority', False) else ""
+                                                        print(f"[{server_name.upper()}] {priority_mark}우선순위 큐에서 항목 가져옴 (대기 후): {item.get('title', '')[:50]}")
+                                                    break
+                                                elif server_name == 'javguru':
+                                                    # JAVGURU는 모든 형태의 제목 검색 가능
+                                                    item = temp_item
+                                                    entry['processed'] = True
+                                                    used_queue = 'priority_list'
+                                                    if item:
+                                                        priority_mark = "[우선순위] " if item.get('is_priority', False) else ""
+                                                        print(f"[{server_name.upper()}] {priority_mark}우선순위 큐에서 항목 가져옴 (대기 후): {item.get('title', '')[:50]}")
+                                                    break
+                                                elif server_name == 'javmost':
+                                                    # JAVMOST는 모든 형태의 제목 검색 가능
                                                     item = temp_item
                                                     entry['processed'] = True
                                                     used_queue = 'priority_list'
@@ -1938,6 +1997,16 @@ class ThumbnailUpdateThread(QThread):
                                                         temp_items.append((None, temp_item))
                                                         entry['processed'] = True
                                                         break
+                                                    elif server_name == 'javguru':
+                                                        # JAVGURU는 모든 형태의 제목 검색 가능
+                                                        temp_items.append((None, temp_item))
+                                                        entry['processed'] = True
+                                                        break
+                                                    elif server_name == 'javmost':
+                                                        # JAVMOST는 모든 형태의 제목 검색 가능
+                                                        temp_items.append((None, temp_item))
+                                                        entry['processed'] = True
+                                                        break
                                                     entry['processed'] = True
                                                     continue
                                                 elif status == 'queue_full_keep_item':
@@ -1964,6 +2033,16 @@ class ThumbnailUpdateThread(QThread):
                                                     break
                                                 elif server_name == 'javbee' and not is_fc2:
                                                     # JAVBEE는 FC2가 아닌 항목만 처리 가능
+                                                    temp_items.append((None, temp_item))
+                                                    entry['processed'] = True
+                                                    break
+                                                elif server_name == 'javguru':
+                                                    # JAVGURU는 모든 형태의 제목 검색 가능
+                                                    temp_items.append((None, temp_item))
+                                                    entry['processed'] = True
+                                                    break
+                                                elif server_name == 'javmost':
+                                                    # JAVMOST는 모든 형태의 제목 검색 가능
                                                     temp_items.append((None, temp_item))
                                                     entry['processed'] = True
                                                     break
@@ -2006,6 +2085,16 @@ class ThumbnailUpdateThread(QThread):
                                                             break
                                                         elif server_name == 'fc2ppv' and is_fc2:
                                                             # FC2PPV는 FC2 항목만 처리 가능
+                                                            item = temp_item
+                                                            used_queue = source_queue
+                                                            break
+                                                        elif server_name == 'javguru':
+                                                            # JAVGURU는 모든 형태의 제목 검색 가능
+                                                            item = temp_item
+                                                            used_queue = source_queue
+                                                            break
+                                                        elif server_name == 'javmost':
+                                                            # JAVMOST는 모든 형태의 제목 검색 가능
                                                             item = temp_item
                                                             used_queue = source_queue
                                                             break
@@ -2126,6 +2215,16 @@ class ThumbnailUpdateThread(QThread):
                                                         found_count += 1
                                                 elif server_name == 'fc2ppv' and is_fc2:
                                                     # FC2PPV는 FC2 항목만 처리 가능
+                                                    if put_to_server_queue(server_name, temp_item):
+                                                        entry['processed'] = True
+                                                        found_count += 1
+                                                elif server_name == 'javguru':
+                                                    # JAVGURU는 모든 형태의 제목 검색 가능
+                                                    if put_to_server_queue(server_name, temp_item):
+                                                        entry['processed'] = True
+                                                        found_count += 1
+                                                elif server_name == 'javmost':
+                                                    # JAVMOST는 모든 형태의 제목 검색 가능
                                                     if put_to_server_queue(server_name, temp_item):
                                                         entry['processed'] = True
                                                         found_count += 1
@@ -2388,19 +2487,27 @@ class ThumbnailUpdateThread(QThread):
                                                     if current_host:
                                                         new_exclude_hosts.append(current_host)
                                                     
-                                                    # 다시 리스트에 추가
-                                                    self.priority_list.append({
-                                                        'item': {
-                                                        'id': torrent_id,
-                                                        'title': title,
-                                                        'thumbnail_url': '',
-                                                        'is_priority': is_priority,
-                                                        'exclude_hosts': new_exclude_hosts
-                                                        },
-                                                        'processed': False,
-                                                        'processing_by': None
-                                                    })
-                                                    print(f"[{server_name.upper()}] 재검색 리스트에 추가: {title[:50]}...")
+                                                    # 이미 우선순위 리스트에 있는지 확인 (중복 방지)
+                                                    existing_entry = None
+                                                    for entry in self.priority_list:
+                                                        if entry['item']['id'] == torrent_id and not entry['processed']:
+                                                            existing_entry = entry
+                                                            break
+                                                    
+                                                    if existing_entry is None:
+                                                        # 다시 리스트에 추가
+                                                        self.priority_list.append({
+                                                            'item': {
+                                                            'id': torrent_id,
+                                                            'title': title,
+                                                            'thumbnail_url': '',
+                                                            'is_priority': is_priority,
+                                                            'exclude_hosts': new_exclude_hosts
+                                                            },
+                                                            'processed': False,
+                                                            'processing_by': None
+                                                        })
+                                                        print(f"[{server_name.upper()}] 재검색 리스트에 추가: {title[:50]}...")
                                         except Exception as e:
                                             print(f"[{server_name.upper()}] .ico 처리 중 오류: {e}")
                                             work_session.rollback()
@@ -2437,7 +2544,10 @@ class ThumbnailUpdateThread(QThread):
                                                 found_count = thread_status[server_name]['found']
                                         
                                         # 출력은 status_lock 밖에서 (카운트 증가 후)
-                                        print(f"[{server_name.upper()}] {priority_mark}썸네일 발견: {title[:50]}... ({thumbnail_url})")
+                                        # 품번 추출
+                                        codes = thread_finder._extract_codes(title)
+                                        code_str = codes[0] if codes else "(품번 없음)"
+                                        print(f"[{server_name.upper()}] {priority_mark}썸네일 발견 [{code_str}]: {title[:50]}... ({thumbnail_url})")
                                         
                                         # already_found가 True일 때만 continue (이미 thread_status 업데이트 완료)
                                         if already_found:
@@ -2508,11 +2618,11 @@ class ThumbnailUpdateThread(QThread):
                                                 torrent_status[torrent_id]['tried_servers'].add(server_name)
                                             
                                             tried_servers = torrent_status[torrent_id].get('tried_servers', set())
-                                            # JAVDB는 FC2 항목도 처리 가능, JAVBEE는 FC2가 아닌 항목만, JAVGURU는 모든 형태 검색 가능
+                                            # JAVDB는 FC2 항목도 처리 가능, JAVBEE는 FC2가 아닌 항목만, JAVGURU, JAVMOST는 모든 형태 검색 가능
                                             if is_fc2_title(title):
-                                                all_servers = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                                all_servers = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                                             else:
-                                                all_servers = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                                all_servers = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                                             remaining_servers = all_servers - tried_servers
                                             
                                             if remaining_servers:
@@ -2539,9 +2649,9 @@ class ThumbnailUpdateThread(QThread):
                                     
                                     # 제목 형태에 따라 처리 가능한 서버 확인
                                     if is_fc2_title(title):
-                                        all_servers_after = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                        all_servers_after = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                                     else:
-                                        all_servers_after = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                        all_servers_after = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                                     
                                     remaining_servers_after = all_servers_after - set(current_searched_servers_after)
                                     
@@ -2549,19 +2659,30 @@ class ThumbnailUpdateThread(QThread):
                                         # 아직 다른 서버에서 검색할 기회가 있으면 우선순위 대기열로 이동
                                         if hasattr(self, 'priority_list') and hasattr(self, 'priority_lock'):
                                             with self.priority_lock:
-                                                # 우선순위 리스트에 추가 (다른 서버에서 먼저 처리하도록)
-                                                self.priority_list.append({
-                                                    'item': {
-                                                        'id': torrent_id,
-                                                        'title': title,
-                                                        'thumbnail_url': '',
-                                                        'is_priority': True,  # 우선순위로 설정
-                                                        'exclude_hosts': exclude_hosts
-                                                    },
-                                                    'processed': False,
-                                                    'processing_by': None
-                                                })
-                                                print(f"[{server_name.upper()}] 썸네일 미발견 → 우선순위 대기열로 이동 (ID: {torrent_id}, 남은 서버: {sorted(remaining_servers_after)}): {title[:50]}...")
+                                                # 이미 우선순위 리스트에 있는지 확인 (중복 방지)
+                                                existing_entry = None
+                                                for entry in self.priority_list:
+                                                    if entry['item']['id'] == torrent_id and not entry['processed']:
+                                                        existing_entry = entry
+                                                        break
+                                                
+                                                if existing_entry is None:
+                                                    # 우선순위 리스트에 추가 (다른 서버에서 먼저 처리하도록)
+                                                    self.priority_list.append({
+                                                        'item': {
+                                                            'id': torrent_id,
+                                                            'title': title,
+                                                            'thumbnail_url': '',
+                                                            'is_priority': True,  # 우선순위로 설정
+                                                            'exclude_hosts': exclude_hosts
+                                                        },
+                                                        'processed': False,
+                                                        'processing_by': None
+                                                    })
+                                                # 품번 추출
+                                                codes = thread_finder._extract_codes(title)
+                                                code_str = codes[0] if codes else "(품번 없음)"
+                                                print(f"[{server_name.upper()}] 썸네일 미발견 [{code_str}]: {title[:50]}... (남은 서버: {sorted(remaining_servers_after)})")
                                         
                                         # 다른 서버 큐에도 추가 (서버 큐가 비어있을 때 빠르게 처리)
                                         with status_lock:
@@ -2582,7 +2703,10 @@ class ThumbnailUpdateThread(QThread):
                                                         put_to_server_queue(other_server, item_copy)
                                     else:
                                         # 모든 서버에서 시도했지만 못 찾음 - 완료로 표시
-                                        print(f"[{server_name.upper()}] 썸네일 미발견 → 모든 서버 시도 완료 (ID: {torrent_id}): {title[:50]}...")
+                                        # 품번 추출
+                                        codes = thread_finder._extract_codes(title)
+                                        code_str = codes[0] if codes else "(품번 없음)"
+                                        print(f"[{server_name.upper()}] 썸네일 미발견 [{code_str}]: {title[:50]}... (모든 서버 시도 완료)")
                                         with status_lock:
                                             if torrent_id not in torrent_status:
                                                 torrent_status[torrent_id] = {'found': False, 'tried_servers': {server_name}}
@@ -2605,11 +2729,11 @@ class ThumbnailUpdateThread(QThread):
                                     torrent_status[torrent_id]['tried_servers'].add(server_name)
                                 
                                 tried_servers = torrent_status[torrent_id].get('tried_servers', set())
-                                # JAVDB는 FC2 항목도 처리 가능, JAVBEE는 FC2가 아닌 항목만, JAVGURU는 모든 형태 검색 가능
+                                # JAVDB는 FC2 항목도 처리 가능, JAVBEE는 FC2가 아닌 항목만, JAVGURU, JAVMOST는 모든 형태 검색 가능
                                 if is_fc2_title(title):
-                                    all_servers = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                    all_servers = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                                 else:
-                                    all_servers = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                    all_servers = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                                 remaining_servers = all_servers - tried_servers
                                 
                                 if remaining_servers:

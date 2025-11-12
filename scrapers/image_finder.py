@@ -497,10 +497,12 @@ class ImageFinder:
                 if len(number) >= 3 and len(number) <= 6:
                     codes.append(code)
         
-        # 일반 AV 코드 패턴 (예: IPX-358, MIDA-398, COGM-089, STARS-573)
+        # 일반 AV 코드 패턴 (예: IPX-358, MIDA-398, COGM-089, STARS-573, heydouga 4144-051)
         # 문자 길이를 1~10자로 확장하여 다양한 케이스 지원
-        pattern_av = r'([A-Z]{1,10})[-\s]?(\d{3,6})(?=[^\w]|$)'
-        matches_av = re.finditer(pattern_av, title_upper)
+        # 숫자 뒤에 하이픈과 추가 숫자가 있는 경우도 포함 (예: heydouga 4144-051)
+        # 원본 형식을 유지하기 위해 원본 제목에서 직접 매칭 (대소문자 구분 없이)
+        pattern_av_extended = r'([A-Za-z]{1,10})[-\s]?(\d{3,6})(?:[-\s](\d{1,6}))?(?=[^\w]|$)'
+        matches_av_extended = re.finditer(pattern_av_extended, title, re.IGNORECASE)
         
         # 전체 코드 형태로도 제외할 목록 (코덱 정보 등)
         excluded_codes = {
@@ -508,26 +510,42 @@ class ImageFinder:
             'X-265', 'X-264', 'X265', 'X264'
         }
         
-        for match_obj in matches_av:
-            prefix, number = match_obj.groups()
-            # 원본 형식 그대로 사용 (대문자로 변환, 공백은 하이픈으로)
-            code = match_obj.group(0).replace(' ', '-').upper()
+        for match_obj in matches_av_extended:
+            prefix, number, suffix_num = match_obj.groups()
+            # 원본 형식 그대로 사용 (공백은 그대로 유지, 대소문자도 원본 유지)
+            code = match_obj.group(0)
             
-            # 이미 문자-숫자-문자 패턴으로 추가된 코드는 제외
-            if code in codes:
+            # 이미 문자-숫자-문자 패턴으로 추가된 코드는 제외 (대소문자 구분 없이 비교)
+            if any(c.upper() == code.upper() for c in codes):
                 continue
             
             # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
             # prefix와 전체 code 모두 체크 (FC2는 이미 별도 패턴으로 처리되므로 제외)
-            if prefix not in excluded_alpha and code.upper() not in excluded_codes:
+            if prefix.upper() not in excluded_alpha and code.upper() not in excluded_codes:
                 # FC2는 이미 별도 패턴으로 처리했으므로 일반 패턴에서는 제외
-                if prefix == 'FC2':
+                if prefix.upper() == 'FC2':
                     continue
                 # 숫자가 너무 작거나 크면 제외 (작품번호는 보통 3-6자리)
                 if len(number) >= 3 and len(number) <= 6:
+                    # suffix_num이 있으면 더 긴 코드를 우선시 (예: heydouga 4144-051)
+                    # suffix_num이 없으면 기본 코드 (예: heydouga 4144)
                     codes.append(code)
         
-        # 중복 제거 (순서 유지)
+        # 중복 제거 및 더 긴 코드 우선 정렬
+        # 예: "heydouga 4144"와 "heydouga 4144-051"이 모두 있으면 더 긴 것을 우선
+        unique_codes = {}
+        for code in codes:
+            # 같은 prefix로 시작하는 코드 중 더 긴 것을 우선 (대소문자 구분 없이)
+            prefix_match = re.match(r'^([A-Za-z]+)', code, re.IGNORECASE)
+            if prefix_match:
+                prefix = prefix_match.group(1).upper()  # 비교를 위해 대문자로 변환
+                if prefix not in unique_codes or len(code) > len(unique_codes[prefix]):
+                    unique_codes[prefix] = code
+        
+        # unique_codes의 값들을 리스트로 변환 (순서 유지)
+        codes = list(unique_codes.values())
+        
+        # 추가로 완전히 동일한 코드 중복 제거
         codes = list(dict.fromkeys(codes))
         
         # 디버그 출력
@@ -774,7 +792,6 @@ class ImageFinder:
                                 img_src = urljoin('https://fc2ppv.stream', img_src)
                         if img_src.startswith('http'):
                             image_urls.append(img_src)
-                            print(f"[ImageFinder] FC2PPV.stream에서 이미지 발견: FC2-PPV-{fc2_code}")
             
             return image_urls
             
@@ -1136,10 +1153,9 @@ class ImageFinder:
                     # 403 응답이면 연결을 처음부터 다시 시도
                     if r.status_code == 403:
                         self.javdb_403_count += 1
-                        print(f"[ImageFinder] JAVDB 403 응답 ({self.javdb_403_count}/50): {base} - 연결을 처음부터 다시 시도")
                         
                         if self.javdb_403_count >= 50:
-                            print(f"[ImageFinder] JAVDB 403 차단 감지: 50번 연속 403 응답으로 인해 JAVDB 비활성화")
+                            print(f"[ImageFinder] JAVDB 서버 연결 안됨: 50번 연속 403 응답으로 인해 JAVDB 비활성화")
                             self.javdb_available = False
                             self.javdb_fail_count = 999  # 차단 상태 유지
                             return []  # 50번 연속이면 차단
@@ -1162,7 +1178,6 @@ class ImageFinder:
                         
                         # 재시도 후에도 403이면 다음 미러로
                         if r.status_code == 403:
-                            print(f"[ImageFinder] JAVDB 403 응답 ({self.javdb_403_count}/50): {base} (재시도 후에도 실패) - 다음 미러 시도")
                             continue  # 다음 미러 도메인으로
                     
                     if r.status_code == 200 and len(r.text) > 1000:
@@ -1173,13 +1188,9 @@ class ImageFinder:
                         if not self.javdb_available:
                             self.javdb_available = True
                             self.javdb_fail_count = 0
-                            print(f"[ImageFinder] JAVDB 재활성화: 연결 성공으로 인해 활성화 상태로 복구")
                         self.javdb_403_count = 0  # 성공 시 403 카운트 리셋
                         break
-                    else:
-                        print(f"[ImageFinder] JAVDB 응답 실패: {base}, status={r.status_code}, len={len(r.text)}")
                 except Exception as e:
-                    print(f"[ImageFinder] JAVDB 요청 오류 ({base}): {e}")
                     continue
             
             if not html:
@@ -1191,7 +1202,7 @@ class ImageFinder:
                     self.javdb_fail_count += 1
                     if self.javdb_fail_count >= 3 and self.javdb_available:
                         self.javdb_available = False
-                        print("[ImageFinder] JAVDB 연결 불가 감지: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
+                        print("[ImageFinder] JAVDB 서버 연결 안됨: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
                 return []
             
             soup = BeautifulSoup(html, 'lxml')
@@ -1298,10 +1309,9 @@ class ImageFinder:
         except (ConnectionError, Timeout) as e:
             # 연속 실패 카운트 및 자동 비활성화
             self.javdb_fail_count += 1
-            print(f"[ImageFinder] JAVDB 연결/타임아웃 오류 (코드: {code}): {e}")
             if self.javdb_fail_count >= 3 and self.javdb_available:
                 self.javdb_available = False
-                print("[ImageFinder] JAVDB 연결 불가 감지: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
+                print("[ImageFinder] JAVDB 서버 연결 안됨: 이후 요청부터 JAVDB 검색을 비활성화합니다.")
             return []
         except RequestException as e:
             print(f"[ImageFinder] JAVDB 요청 예외 (코드: {code}): {e}")
@@ -1583,10 +1593,7 @@ class ImageFinder:
                     return []
             
             if not view_url or not title_text:
-                print(f"[ImageFinder] JAVMOST 상세 페이지를 찾지 못함 (키워드: {keyword[:50]})")
                 return []
-            
-            print(f"[ImageFinder] JAVMOST 상세 페이지 발견: {view_url} (제목: {title_text[:50]})")
             
             # 상세 페이지에서 이미지 추출 (테스트 코드와 동일하게 get_html 사용)
             # 403 체크를 위해 try-except로 처리
@@ -1601,12 +1608,11 @@ class ImageFinder:
                 except requests.exceptions.HTTPError as e:
                     if e.response and e.response.status_code == 403:
                         self.javmost_403_count += 1
-                        print(f"[ImageFinder] JAVMOST 403 응답 ({self.javmost_403_count}/50): {view_url} - 연결을 처음부터 다시 시도")
                         
                         if self.javmost_403_count >= 50:
                             if not self.javmost_blocked:
                                 self.javmost_blocked = True
-                                print(f"[ImageFinder] JAVMOST 403 차단 감지: 50번 연속 403 응답으로 인해 JAVMOST 검색 비활성화")
+                                print(f"[ImageFinder] JAVMOST 서버 연결 안됨: 50번 연속 403 응답으로 인해 JAVMOST 검색 비활성화")
                             return []
                         
                         if retry < max_retries - 1:
@@ -1627,14 +1633,12 @@ class ImageFinder:
                             time.sleep(1.2)
                             continue
                         else:
-                            print(f"[ImageFinder] JAVMOST HTTP 오류 (키워드: {keyword[:50]}): {e}")
                             return []
                 except Exception as e:
                     if retry < max_retries - 1:
                         time.sleep(1.2)
                         continue
                     else:
-                        print(f"[ImageFinder] JAVMOST 상세 페이지 로딩 오류 (키워드: {keyword[:50]}): {e}")
                         return []
             
             if not html:
@@ -1711,7 +1715,6 @@ class ImageFinder:
                     seen.add(u)
             
             # 필터링 및 검증
-            print(f"[ImageFinder] JAVMOST 후보 이미지 {len(cands)}개 발견, 검증 중...")
             for item in cands:
                 u, how = item["url"], item["how"]
                 
@@ -1737,14 +1740,8 @@ class ImageFinder:
                     continue
                 
                 results.append(u)
-                print(f"[ImageFinder] JAVMOST 이미지 발견: {u[:80]}... (방법: {how})")
                 if len(results) >= 5:
                     break
-            
-            if results:
-                print(f"[ImageFinder] JAVMOST 총 {len(results)}개 이미지 발견 (키워드: {keyword[:50]})")
-            else:
-                print(f"[ImageFinder] JAVMOST 이미지 없음 (키워드: {keyword[:50]}, 후보: {len(cands)}개)")
             
             return results
             
@@ -2299,12 +2296,11 @@ class ImageFinder:
                 # HTTP 403이면 카운트 증가 및 재시도 (서버 접속부터 다시)
                 if response.status_code == 403:
                     self.javbee_403_count += 1
-                    print(f"[ImageFinder] JAVBee 403 응답 ({self.javbee_403_count}/50): {search_url} - 연결을 처음부터 다시 시도")
                     
                     if self.javbee_403_count >= 50:
                         if not self.javbee_blocked:
                             self.javbee_blocked = True
-                            print(f"[ImageFinder] JAVBee 403 차단 감지: 50번 연속 403 응답으로 인해 JAVBee 검색 비활성화")
+                            print(f"[ImageFinder] JAVBee 서버 연결 안됨: 50번 연속 403 응답으로 인해 JAVBee 검색 비활성화")
                         return []
                     
                     if retry < max_retries - 1:
@@ -3215,12 +3211,11 @@ class ImageFinder:
                 # HTTP 403이면 카운트 증가 및 재시도 (서버 접속부터 다시)
                 if response.status_code == 403:
                     self.javguru_403_count += 1
-                    print(f"[ImageFinder] JAVGURU 403 응답 ({self.javguru_403_count}/50): {search_url} - 연결을 처음부터 다시 시도")
                     
                     if self.javguru_403_count >= 50:
                         if not self.javguru_blocked:
                             self.javguru_blocked = True
-                            print(f"[ImageFinder] JAVGURU 403 차단 감지: 50번 연속 403 응답으로 인해 JAVGURU 검색 비활성화")
+                            print(f"[ImageFinder] JAVGURU 서버 연결 안됨: 50번 연속 403 응답으로 인해 JAVGURU 검색 비활성화")
                         return []
                     
                     if retry < max_retries - 1:
