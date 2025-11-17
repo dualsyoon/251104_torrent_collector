@@ -3,10 +3,10 @@ import re
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPushButton, QProgressBar, QMessageBox, QStatusBar, QMenuBar, QMenu,
-    QComboBox, QLabel, QLineEdit
+    QComboBox, QLabel, QLineEdit, QSystemTrayIcon
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSettings
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QIcon
 from .filter_panel import FilterPanel
 from .torrent_list import TorrentListWidget
 from database import Database
@@ -3356,10 +3356,87 @@ class MainWindow(QMainWindow):
         self.gif_cleanup_thread = None
         # 썸네일 검색 서버 초기화 스레드 참조 (소멸 방지)
         self.reset_searched_servers_thread = None
+        # 시스템 트레이 초기화
+        self.tray_icon = None
+        self._init_system_tray()
         self.init_ui()
         # 부팅 시 GIF 썸네일 검사 및 초기화 (백그라운드)
         self._cleanup_gif_thumbnails()
         self.load_torrents()  # load_torrents 내에서 썸네일 업데이트 자동 시작
+    
+    def _init_system_tray(self):
+        """시스템 트레이 초기화"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            print("[트레이] 시스템 트레이를 사용할 수 없습니다")
+            return
+        
+        # 트레이 아이콘 생성
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        # 기본 아이콘 설정 (윈도우 기본 아이콘 사용)
+        if self.windowIcon().isNull():
+            # 기본 아이콘이 없으면 애플리케이션 아이콘 사용
+            app_icon = QIcon.fromTheme("application-x-executable")
+            if app_icon.isNull():
+                # 테마 아이콘도 없으면 빈 아이콘 생성
+                from PySide6.QtGui import QPixmap
+                pixmap = QPixmap(16, 16)
+                pixmap.fill(Qt.transparent)
+                app_icon = QIcon(pixmap)
+            self.tray_icon.setIcon(app_icon)
+        else:
+            self.tray_icon.setIcon(self.windowIcon())
+        
+        self.tray_icon.setToolTip("토렌트 수집기")
+        
+        # 트레이 메뉴 생성
+        tray_menu = QMenu(self)
+        
+        show_action = QAction("표시", self)
+        show_action.triggered.connect(self.show_window)
+        tray_menu.addAction(show_action)
+        
+        hide_action = QAction("숨기기", self)
+        hide_action.triggered.connect(self.hide)
+        tray_menu.addAction(hide_action)
+        
+        tray_menu.addSeparator()
+        
+        quit_action = QAction("종료", self)
+        quit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(quit_action)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        
+        # 트레이 아이콘 클릭 이벤트 (더블클릭 시 창 표시/숨김)
+        self.tray_icon.activated.connect(self._on_tray_icon_activated)
+        
+        # 트레이 아이콘 표시
+        self.tray_icon.show()
+    
+    def _on_tray_icon_activated(self, reason):
+        """트레이 아이콘 활성화 이벤트 처리"""
+        if reason == QSystemTrayIcon.DoubleClick:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.show_window()
+    
+    def show_window(self):
+        """윈도우 표시 및 활성화"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+    
+    def quit_application(self):
+        """애플리케이션 종료"""
+        # 강제 종료 플래그 설정
+        self._force_quit = True
+        # 트레이 아이콘 숨김
+        if self.tray_icon:
+            self.tray_icon.hide()
+        # closeEvent 호출하여 정상 종료
+        self.close()
     
     def init_ui(self):
         """UI 초기화"""
@@ -3531,7 +3608,7 @@ class MainWindow(QMainWindow):
         
         exit_action = QAction("종료(&X)", self)
         exit_action.setShortcut("Ctrl+Q")
-        exit_action.triggered.connect(self.close)
+        exit_action.triggered.connect(self.quit_application)
         file_menu.addAction(exit_action)
         
         # 데이터 메뉴
@@ -4488,7 +4565,24 @@ class MainWindow(QMainWindow):
         self.db_writer_stats['duplicate'] += stats.get('duplicate', 0)
     
     def closeEvent(self, event):
-        """윈도우 닫기 이벤트 (스레드 정리)"""
+        """윈도우 닫기 이벤트 (트레이로 숨기기 또는 종료)"""
+        # 시스템 트레이가 활성화되어 있고, 실제 종료가 아닌 경우 트레이로 숨김
+        if self.tray_icon and self.tray_icon.isVisible():
+            # 사용자가 명시적으로 종료를 요청한 경우가 아니면 트레이로 숨김
+            # (Ctrl+Q 또는 메뉴에서 종료 선택 시에는 실제 종료)
+            if not hasattr(self, '_force_quit'):
+                event.ignore()
+                self.hide()
+                if self.tray_icon:
+                    self.tray_icon.showMessage(
+                        "토렌트 수집기",
+                        "작업표시줄로 최소화되었습니다",
+                        QSystemTrayIcon.Information,
+                        2000
+                    )
+                return
+        
+        # 실제 종료 처리
         print("[종료] 앱 종료 중... 스레드 정리")
         
         # DB Writer Thread 정리
