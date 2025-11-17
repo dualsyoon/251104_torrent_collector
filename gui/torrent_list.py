@@ -780,10 +780,12 @@ class TorrentListWidget(QWidget):
                 self.current_hover_row = None
                 self._hide_preview()
             elif event.type() == QEvent.MouseMove:
-                # 미리보기 위치를 커서에 맞춰 이동
+                # 미리보기 위치를 커서에 맞춰 이동 (경계 체크 포함)
                 if self.preview_label and self.preview_label.isVisible():
-                    pos = QCursor.pos()
-                    self.preview_label.move(pos.x() + 16, pos.y() + 16)
+                    preview_width = self.preview_label.width()
+                    preview_height = self.preview_label.height()
+                    x, y = self._calculate_preview_position(preview_width, preview_height)
+                    self.preview_label.move(x, y)
         # 스냅샷 라벨 호버 처리
         if isinstance(obj, QLabel) and obj.property('snapshot_url'):
             url = obj.property('snapshot_url')
@@ -803,6 +805,67 @@ class TorrentListWidget(QWidget):
             self.preview_label.setAttribute(Qt.WA_TransparentForMouseEvents)
             self.preview_label.setStyleSheet("background: rgba(0,0,0,0.6); border: 1px solid #444;")
             self.preview_label.hide()
+
+    def _calculate_preview_position(self, preview_width: int, preview_height: int) -> tuple[int, int]:
+        """미리보기 라벨의 최적 위치 계산 (경계 체크 포함)
+        
+        Args:
+            preview_width: 미리보기 이미지 너비
+            preview_height: 미리보기 이미지 높이
+            
+        Returns:
+            (x, y) 튜플 - 전역 좌표
+        """
+        from PySide6.QtGui import QGuiApplication
+        cursor_pos = QCursor.pos()
+        offset = 16
+        margin = 10
+        
+        win = self.window()
+        if win:
+            # 윈도우 프레임을 제외한 실제 클라이언트 영역을 전역 좌표로 변환
+            win_top_left = win.mapToGlobal(win.rect().topLeft())
+            win_bottom_right = win.mapToGlobal(win.rect().bottomRight())
+            
+            app_left = win_top_left.x()
+            app_top = win_top_left.y()
+            app_right = win_bottom_right.x()
+            app_bottom = win_bottom_right.y()
+            
+            # 기본 위치: 커서 오른쪽 아래 (16px 오프셋)
+            x = cursor_pos.x() + offset
+            y = cursor_pos.y() + offset
+
+            # 오른쪽으로 벗어나면 왼쪽에 표시
+            if x + preview_width + margin > app_right:
+                x = cursor_pos.x() - preview_width - offset
+
+            # 아래로 벗어나면 위쪽에 표시
+            if y + preview_height + margin > app_bottom:
+                y = cursor_pos.y() - preview_height - offset
+
+            # 여전히 벗어나면 강제로 앱 내부로 이동 (최종 안전장치)
+            x = max(app_left + margin, min(x, app_right - preview_width - margin))
+            y = max(app_top + margin, min(y, app_bottom - preview_height - margin))
+            
+            return (x, y)
+        else:
+            # 윈도우를 찾을 수 없으면 화면 경계로 제한
+            screen = QGuiApplication.screenAt(cursor_pos) or QGuiApplication.primaryScreen()
+            screen_geo = screen.availableGeometry()
+            
+            x = cursor_pos.x() + offset
+            y = cursor_pos.y() + offset
+
+            if x + preview_width > screen_geo.right():
+                x = cursor_pos.x() - preview_width - offset
+            if y + preview_height > screen_geo.bottom():
+                y = cursor_pos.y() - preview_height - offset
+
+            x = max(screen_geo.left(), min(x, screen_geo.right() - preview_width))
+            y = max(screen_geo.top(), min(y, screen_geo.bottom() - preview_height))
+            
+            return (x, y)
 
     def _show_preview(self, pixmap: QPixmap):
         self._ensure_preview_label()
@@ -872,23 +935,8 @@ class TorrentListWidget(QWidget):
             self.preview_label.setPixmap(display_pixmap)
             self.preview_label.resize(preview_width, preview_height)
             
-            # 기본 위치: 커서 오른쪽 아래 (16px 오프셋)
-            offset = 16
-            x = cursor_pos.x() + offset
-            y = cursor_pos.y() + offset
-
-            # 오른쪽으로 벗어나면 왼쪽에 표시
-            if x + preview_width + margin > app_right:
-                x = cursor_pos.x() - preview_width - offset
-
-            # 아래로 벗어나면 위쪽에 표시
-            if y + preview_height + margin > app_bottom:
-                y = cursor_pos.y() - preview_height - offset
-
-            # 여전히 벗어나면 강제로 앱 내부로 이동 (최종 안전장치)
-            x = max(app_left + margin, min(x, app_right - preview_width - margin))
-            y = max(app_top + margin, min(y, app_bottom - preview_height - margin))
-            
+            # 위치 계산 메서드 사용
+            x, y = self._calculate_preview_position(preview_width, preview_height)
             self.preview_label.move(x, y)
             self.preview_label.show()
         else:
@@ -902,17 +950,8 @@ class TorrentListWidget(QWidget):
             self.preview_label.setPixmap(display_pixmap)
             self.preview_label.resize(preview_width, preview_height)
             
-            x = cursor_pos.x() + 16
-            y = cursor_pos.y() + 16
-            
-            if x + preview_width > screen_geo.right():
-                x = cursor_pos.x() - preview_width - 16
-            if y + preview_height > screen_geo.bottom():
-                y = cursor_pos.y() - preview_height - 16
-            
-            x = max(screen_geo.left(), min(x, screen_geo.right() - preview_width))
-            y = max(screen_geo.top(), min(y, screen_geo.bottom() - preview_height))
-            
+            # 위치 계산 메서드 사용
+            x, y = self._calculate_preview_position(preview_width, preview_height)
             self.preview_label.move(x, y)
             self.preview_label.show()
 
