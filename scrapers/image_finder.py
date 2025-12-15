@@ -448,7 +448,18 @@ class ImageFinder:
         codes = []
         title_upper = title.upper()
         
-        # FC2 패턴 우선 (예: FC2-PPV-1234567 또는 FC2-1234567)
+        # Heydouga 패턴 우선 (예: Heydouga 4102-PPV012, HEYDOUGA-4102-012)
+        # Heydouga는 4자리 숫자와 추가 숫자 조합으로 구성
+        pattern_heydouga = r'HEYDOUGA[-\s]?(\d{4})[-\s]?(PPV)?[-\s]?(\d{3,6})'
+        matches_heydouga = re.findall(pattern_heydouga, title_upper)
+        for match in matches_heydouga:
+            prefix_num, ppv_part, suffix_num = match
+            if ppv_part:  # PPV가 있으면 Heydouga 4102-PPV012
+                codes.append(f"Heydouga {prefix_num}-PPV{suffix_num}")
+            else:  # 없으면 Heydouga 4102-012
+                codes.append(f"Heydouga {prefix_num}-{suffix_num}")
+        
+        # FC2 패턴 (예: FC2-PPV-1234567 또는 FC2-1234567)
         pattern_fc2 = r'FC2[-\s]?(PPV[-\s]?)?(\d{6,8})'
         matches_fc2 = re.findall(pattern_fc2, title_upper)
         for match in matches_fc2:
@@ -529,10 +540,10 @@ class ImageFinder:
                 continue
             
             # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
-            # prefix와 전체 code 모두 체크 (FC2는 이미 별도 패턴으로 처리되므로 제외)
+            # prefix와 전체 code 모두 체크 (FC2, Heydouga는 이미 별도 패턴으로 처리되므로 제외)
             if prefix.upper() not in excluded_alpha and code.upper() not in excluded_codes:
-                # FC2는 이미 별도 패턴으로 처리했으므로 일반 패턴에서는 제외
-                if prefix.upper() == 'FC2':
+                # FC2, Heydouga는 이미 별도 패턴으로 처리했으므로 일반 패턴에서는 제외
+                if prefix.upper() in ('FC2', 'HEYDOUGA'):
                     continue
                 # 숫자가 너무 작거나 크면 제외 (작품번호는 보통 3-6자리)
                 if len(number) >= 3 and len(number) <= 6:
