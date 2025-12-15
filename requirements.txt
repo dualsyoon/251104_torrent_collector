@@ -7,3 +7,4 @@ cloudscraper>=1.2.71
 urllib3>=2.0.0
 selenium>=4.15.0
 webdriver-manager>=4.0.1
+playwright>=1.40.0

@@ -26,6 +26,15 @@ try:
 except ImportError:
     SELENIUM_AVAILABLE = False
 
+# Playwright(선택적): HTML 수집을 Playwright로 전환하여 403/봇차단 회피
+try:
+    from scrapers.playwright_server import get_playwright_server, PlaywrightHTTPError
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    get_playwright_server = None
+    PlaywrightHTTPError = Exception
+    PLAYWRIGHT_AVAILABLE = False
+
 
 class ImageFinder:
     """토렌트 제목으로 썸네일 이미지 검색"""
@@ -1413,6 +1422,14 @@ class ImageFinder:
         """
         if self.javmost_blocked:
             return []
+
+        # Playwright 우선(요구사항): 가능하면 Playwright 경로로 처리하고,
+        # 실패 시 기존 requests 기반 로직으로 폴백한다.
+        if PLAYWRIGHT_AVAILABLE and get_playwright_server is not None:
+            try:
+                return self._search_javmost_playwright(keyword)
+            except Exception as e:
+                print(f"[ImageFinder] JAVMOST Playwright 경로 실패 → requests 폴백: {e}")
         
         try:
             from urllib.parse import urlparse, urljoin as urljoin_parse
@@ -1748,6 +1765,236 @@ class ImageFinder:
         except Exception as e:
             print(f"[ImageFinder] JAVMOST 검색 오류: {e}")
             return []
+
+    def _search_javmost_playwright(self, keyword: str) -> List[str]:
+        """JAVMOST Playwright 버전(재사용/문제 시 재초기화).
+
+        - `image_server_test/test_javmost_cover_search.py` 로직을 앱에 맞게 축약 이식
+        - Playwright는 전역 매니저에서 스레드별 1회 초기화 후 재사용
+        """
+        if self.javmost_blocked:
+            return []
+        if not (PLAYWRIGHT_AVAILABLE and get_playwright_server):
+            return []
+
+        from urllib.parse import urlparse, urljoin as urljoin_parse
+
+        BASE = "https://www5.javmost.com/"
+        MIN_BYTES = 10 * 1024
+
+        pw = get_playwright_server()
+
+        THUMB_HOSTS = ("i0.wp.com", "i1.wp.com", "i2.wp.com")
+        ASSET_SEG_RE = re.compile(
+            r"(?:^|/)(?:logo|favicon|sprite|icons?|ads?|adserver|banners?|static|assets|themes|emoji|svg)(?:/|$)",
+            re.I,
+        )
+        AD_HOST_RE = re.compile(r"(?:exosrv|exdynsrv|syndication|doubleclick|adnxs|taboola|outbrain|histats)", re.I)
+
+        def is_probably_asset(u: str) -> bool:
+            pr = urlparse(u)
+            if AD_HOST_RE.search(pr.netloc):
+                return True
+            if any(host in pr.netloc for host in THUMB_HOSTS):
+                return True
+            return bool(ASSET_SEG_RE.search(pr.path))
+
+        def compile_keyword_strict(kw: str):
+            m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", kw.strip())
+            if not m:
+                k = kw.strip()
+                k = re.escape(k).replace(r"\-", "-?")
+                return re.compile(rf"(?<![A-Za-z0-9]){k}(?![A-Za-z0-9])", re.I)
+            prefix, num = m.groups()
+            return re.compile(rf"(?<![A-Za-z0-9]){re.escape(prefix)}-?{re.escape(num)}(?![A-Za-z0-9])", re.I)
+
+        def normalize_code(kw: str):
+            m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", kw.strip())
+            if not m:
+                return None, None, None
+            prefix, num = m.groups()
+            return prefix.upper(), num, f"{prefix.upper()}-{num}"
+
+        def try_direct_view(code: str):
+            view = urljoin_parse(BASE, f"{code}/")
+            try:
+                html = pw.get_html(view, referer=BASE, max_retries=3)
+                soup = BeautifulSoup(html, "lxml")
+                title = ""
+                if soup.title and soup.title.get_text():
+                    title = soup.title.get_text(" ", strip=True)
+                h = soup.find(["h1", "h2"])
+                if not title and h:
+                    title = h.get_text(" ", strip=True)
+                return view, (title or "")
+            except Exception:
+                return None, None
+
+        def find_from_tag_listing(prefix: str, kw_re: re.Pattern):
+            tag_url = urljoin_parse(BASE, f"tag/{prefix}/")
+            try:
+                html = pw.get_html(tag_url, referer=BASE, max_retries=3)
+                soup = BeautifulSoup(html, "lxml")
+                for a in soup.select("a[href]"):
+                    txt = (a.get_text(" ", strip=True) or "")[:500]
+                    href = a.get("href") or ""
+                    if not href:
+                        continue
+                    if any(seg in href for seg in ("/tag/", "/maker/", "/director/", "/category/", "/search/", "/allcode/")):
+                        continue
+                    if kw_re.search(txt):
+                        return urljoin_parse(BASE, href), txt
+                return None, None
+            except Exception:
+                return None, None
+
+        def resolve_view_url_and_title(kw: str):
+            kw_re = compile_keyword_strict(kw)
+            prefix, _num, code = normalize_code(kw)
+            if code:
+                v, t = try_direct_view(code)
+                if v and kw_re.search(t or ""):
+                    return v, t
+            if prefix:
+                v, t = find_from_tag_listing(prefix, kw_re)
+                if v and t and kw_re.search(t):
+                    return v, t
+            return None, None
+
+        # 1) 상세 URL 찾기
+        view_url, title_text = resolve_view_url_and_title(keyword)
+        if not view_url or not title_text:
+            return []
+
+        # 2) 상세 HTML 가져오기 (403이면 카운트/차단/리셋)
+        try:
+            html = pw.get_html(view_url, referer=BASE, max_retries=3)
+            if self.javmost_403_count > 0:
+                self.javmost_403_count = 0
+        except PlaywrightHTTPError as e:
+            if getattr(e, "status", None) == 403:
+                self.javmost_403_count += 1
+                if self.javmost_403_count >= 50:
+                    if not self.javmost_blocked:
+                        self.javmost_blocked = True
+                        print("[ImageFinder] JAVMOST 서버 연결 안됨: 50번 연속 403 응답으로 인해 JAVMOST 검색 비활성화")
+                    return []
+            pw.reset_current_thread()
+            return []
+        except Exception:
+            pw.reset_current_thread()
+            return []
+
+        soup = BeautifulSoup(html, "lxml")
+
+        def find_description_nodes(s: BeautifulSoup):
+            nodes = []
+            nodes.extend(s.select("article, main, section"))
+            nodes.extend(s.select("div.post, div.single, div.entry-content, div.content, .container"))
+            if not nodes:
+                nodes = [s]
+            seen, uniq = set(), []
+            for n in nodes:
+                k = str(n)
+                if k not in seen:
+                    uniq.append(n)
+                    seen.add(k)
+            return uniq[:5]
+
+        raw = []
+
+        def add_img_url(u, how):
+            if u:
+                raw.append({"url": urljoin_parse(view_url, u), "how": how})
+
+        nodes = find_description_nodes(soup) or [soup]
+        extra = soup.select("div#main, div#primary, div#content, div.single, div.entry-content")
+        nodes = (nodes + extra)[:8]
+
+        DATA_ATTR_HINTS = {
+            "data-src",
+            "data-original",
+            "data-lazy",
+            "data-lazy-src",
+            "data-echo",
+            "data-image",
+            "data-img",
+            "data-url",
+            "data-srcset",
+        }
+
+        for n in nodes:
+            for img in n.find_all("img"):
+                add_img_url(img.get("src"), "img.src")
+                srcset = img.get("srcset")
+                if srcset:
+                    for p in [p.strip() for p in srcset.split(",") if p.strip()]:
+                        add_img_url(p.split()[0], "img.srcset")
+                for k, v in img.attrs.items():
+                    if not v or not isinstance(v, str):
+                        continue
+                    if k in DATA_ATTR_HINTS or k.startswith("data-"):
+                        add_img_url(v, f"img.{k}")
+
+        for n in nodes:
+            for nos in n.find_all("noscript"):
+                inner = BeautifulSoup(nos.get_text() or "", "lxml")
+                for img in inner.find_all("img"):
+                    add_img_url(img.get("src"), "noscript.img.src")
+                    for k in ("data-src", "data-original", "data-lazy", "data-lazy-src"):
+                        add_img_url(img.get(k), f"noscript.img.{k}")
+                    sset = img.get("srcset")
+                    if sset:
+                        for p in [p.strip() for p in sset.split(",") if p.strip()]:
+                            add_img_url(p.split()[0], "noscript.img.srcset")
+
+        # 메타 폴백(기본 ON)
+        for m in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
+            add_img_url(m.get("content"), "meta.og_or_twitter")
+        for l in soup.select('link[rel="image_src"]'):
+            add_img_url(l.get("href"), "link.image_src")
+
+        # 포스터 추정 (img{1..5}.javmost.com/images/<CODE>.webp)
+        pr = urlparse(view_url)
+        host = pr.netloc.lower()
+        if host.endswith("javmost.com"):
+            slug = pathlib.Path(pr.path).parts[-1].strip("/") or ""
+            mcode = re.search(r"([A-Za-z]+-?\d+)", slug)
+            if mcode:
+                code = mcode.group(1).upper().replace("--", "-")
+                for n in ("3", "2", "1", "4", "5"):
+                    cand = f"https://img{n}.javmost.com/images/{code}.webp"
+                    add_img_url(cand, f"poster.guess.img{n}")
+
+        # dedupe
+        seen, cands = set(), []
+        for it in raw:
+            u = (it["url"] or "").strip()
+            if u and u not in seen:
+                cands.append(u)
+                seen.add(u)
+
+        results: List[str] = []
+        for u in cands:
+            if is_probably_asset(u):
+                continue
+            ext = pathlib.Path(urlparse(u).path).suffix.lower()
+            if ext == ".html":
+                continue
+            probe = pw.probe_image(u, referer=view_url)
+            if not probe.get("ok"):
+                continue
+            size_ok = (probe.get("size") is None) or (probe.get("size") >= MIN_BYTES)
+            if not size_ok:
+                continue
+            ct = (probe.get("ct") or "").lower()
+            if "gif" in ct:
+                continue
+            results.append(probe.get("final_url") or u)
+            if len(results) >= 5:
+                break
+
+        return results
     
     def _search_javmost_selenium(self, code: str) -> List[str]:
         """Selenium을 이용한 javmost.com 검색 (통신 실패 시 대체)"""
@@ -2960,6 +3207,17 @@ class ImageFinder:
         Args:
             keyword: 검색 키워드 (작품번호 또는 제목)
         """
+        if self.javguru_blocked:
+            return []
+
+        # Playwright 우선(요구사항): 가능하면 Playwright 경로로 처리하고,
+        # 실패 시 기존 cloudscraper/requests 기반 로직으로 폴백한다.
+        if PLAYWRIGHT_AVAILABLE and get_playwright_server is not None:
+            try:
+                return self._search_javguru_playwright(keyword)
+            except Exception as e:
+                print(f"[ImageFinder] JAVGURU Playwright 경로 실패 → requests 폴백: {e}")
+
         try:
             from urllib.parse import urlparse, urljoin as urljoin_parse, urlencode
             BASE = "https://jav.guru"
@@ -3381,6 +3639,202 @@ class ImageFinder:
         except Exception as e:
             print(f"[ImageFinder] JAV.GURU 검색 오류: {e}")
             return []
+
+    def _search_javguru_playwright(self, keyword: str) -> List[str]:
+        """JAV.GURU Playwright 버전(재사용/문제 시 재초기화).
+
+        - `image_server_test/test_javguru_cover_search.py` 로직을 앱에 맞게 이식
+        - HTML 수집은 Playwright로만 수행
+        - Playwright는 전역 매니저에서 스레드별 1회 초기화 후 재사용
+        """
+        if self.javguru_blocked:
+            return []
+        if not (PLAYWRIGHT_AVAILABLE and get_playwright_server):
+            return []
+
+        from urllib.parse import urlparse, urljoin as urljoin_parse, urlencode
+
+        BASE = "https://jav.guru"
+        MIN_BYTES = 10 * 1024
+
+        pw = get_playwright_server()
+
+        ASSET_SEG_RE = re.compile(
+            r"(?:^|/)(?:logo|favicon|sprite|icons?|ads?|banners?|static|themes|emoji|svg)(?:/|$)",
+            re.I,
+        )
+
+        def is_probably_asset(u: str) -> bool:
+            return bool(ASSET_SEG_RE.search(urlparse(u).path))
+
+        def compile_keyword_strict(kw: str):
+            m = re.match(r"^\s*([A-Za-z]+)\s*-?\s*(\d+)\s*$", kw.strip())
+            if not m:
+                k = kw.strip()
+                k = re.escape(k).replace(r"\-", "-?")
+                return re.compile(rf"(?<![A-Za-z0-9]){k}(?![A-Za-z0-9])", re.I)
+            prefix, num = m.groups()
+            return re.compile(rf"(?<![A-Za-z0-9]){re.escape(prefix)}-?{re.escape(num)}(?![A-Za-z0-9])", re.I)
+
+        def head_ok(url: str, referer: str) -> dict:
+            # 이미지 검증은 probe_image로 통일(Playwright). 실패 시 ok=False.
+            return pw.probe_image(url, referer=referer)
+
+        def find_first_card_title_link(soup: BeautifulSoup):
+            # test_javguru_cover_search.py의 selector를 반영
+            for card in soup.select(".grid1, .grid2, .row > div, article"):
+                a = card.select_one("h2 a, h1 a, .entry-title a, a")
+                if not a:
+                    continue
+                title_txt = (a.get_text(" ", strip=True) or "").strip()
+                link = a.get("href", "") or ""
+                if len(title_txt) >= 3 and link:
+                    return title_txt, link
+            return None, None
+
+        def collect_post_cover_images(post_html: str, base_url: str):
+            soup = BeautifulSoup(post_html, "lxml")
+            cands = []
+
+            def add(u: Optional[str], how: str):
+                if not u:
+                    return
+                if u.startswith("//"):
+                    u = "https:" + u
+                cands.append({"url": urljoin_parse(base_url, u), "how": how})
+
+            # 1) 대표 이미지
+            for sel in ["img.wp-post-image", ".post-thumbnail img"]:
+                tag = soup.select_one(sel)
+                if tag:
+                    add(tag.get("src"), f"{sel}.src")
+                    add(tag.get("data-src"), f"{sel}.data-src")
+
+            # 2) 본문 첫 이미지
+            first_img = soup.select_one(".entry-content img, article img")
+            if first_img:
+                add(first_img.get("src"), "entry-first-img.src")
+                add(first_img.get("data-src"), "entry-first-img.data-src")
+
+            # 3) OG/Twitter
+            og = soup.find("meta", property="og:image")
+            if og and og.get("content"):
+                add(og.get("content"), "meta.og:image")
+            tw = soup.find("meta", attrs={"name": "twitter:image"})
+            if tw and tw.get("content"):
+                add(tw.get("content"), "meta.twitter:image")
+
+            uniq, seen = [], set()
+            for c in cands:
+                if c["url"] and c["url"] not in seen:
+                    uniq.append(c)
+                    seen.add(c["url"])
+            return uniq
+
+        def fetch_html(url: str, referer: str):
+            try:
+                html = pw.get_html(url, referer=referer, max_retries=3)
+                if self.javguru_403_count > 0:
+                    self.javguru_403_count = 0
+                return html
+            except PlaywrightHTTPError as e:
+                if getattr(e, "status", None) == 403:
+                    self.javguru_403_count += 1
+                    if self.javguru_403_count >= 50:
+                        if not self.javguru_blocked:
+                            self.javguru_blocked = True
+                            print("[ImageFinder] JAVGURU 서버 연결 안됨: 50번 연속 403 응답으로 인해 JAVGURU 검색 비활성화")
+                        return None
+                # 문제 발생 시에만 Playwright 서버 재초기화(요구사항)
+                pw.reset_current_thread()
+                return None
+            except Exception:
+                pw.reset_current_thread()
+                return None
+
+        kw_re = compile_keyword_strict(keyword)
+
+        # 1) 검색 페이지에서 첫 결과(제목 엄격매칭) → 포스트 링크 확보
+        search_url = f"{BASE}/?{urlencode({'s': keyword})}"
+        search_html = fetch_html(search_url, referer=BASE + "/")
+        post_url = None
+        post_title = None
+        if search_html and len(search_html) > 500:
+            soup = BeautifulSoup(search_html, "lxml")
+            t, link = find_first_card_title_link(soup)
+            if t and link and kw_re.search(t):
+                post_title, post_url = t, link
+
+        # 2) 폴백: WP REST → RSS (Playwright로 가져오기)
+        if not post_url:
+            api = f"{BASE}/wp-json/wp/v2/search?{urlencode({'search': keyword, 'per_page': 10})}"
+            raw = fetch_html(api, referer=BASE + "/")
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, list):
+                        for obj in data:
+                            link = obj.get("url") or obj.get("link")
+                            title = obj.get("title") or obj.get("title_plain") or ""
+                            if link and title:
+                                title_text = BeautifulSoup(str(title), "html.parser").get_text(" ", strip=True)
+                                if kw_re.search(title_text):
+                                    post_url, post_title = link, title_text
+                                    break
+                except Exception:
+                    pass
+
+        if not post_url:
+            feed = f"{BASE}/?{urlencode({'s': keyword, 'feed': 'rss2'})}"
+            raw = fetch_html(feed, referer=BASE + "/")
+            if raw:
+                try:
+                    soup = BeautifulSoup(raw, "xml")
+                    item = soup.find("item")
+                    if item:
+                        link = item.findtext("link")
+                        title = item.findtext("title")
+                        if link and title and kw_re.search(title):
+                            post_url, post_title = link, title
+                except Exception:
+                    pass
+
+        if not post_url or not post_title:
+            return []
+
+        if not kw_re.search(post_title or ""):
+            return []
+
+        # 3) 포스트 페이지에서 대표 이미지 후보 수집 → 검증 후 반환
+        post_html = fetch_html(post_url, referer=BASE + "/")
+        if not post_html:
+            return []
+
+        post_imgs = collect_post_cover_images(post_html, post_url)
+        if not post_imgs:
+            return []
+
+        results: List[str] = []
+        for item in post_imgs[:10]:
+            u = item["url"]
+            if not u:
+                continue
+            if is_probably_asset(u):
+                continue
+            probe = head_ok(u, referer=post_url)
+            if not probe.get("ok"):
+                continue
+            size_ok = (probe.get("size") is None) or (probe.get("size") >= MIN_BYTES)
+            if not size_ok:
+                continue
+            ct = (probe.get("ct") or "").lower()
+            if "gif" in ct:
+                continue
+            results.append(probe.get("final_url") or u)
+            if len(results) >= 5:
+                break
+
+        return results
     
     def _clean_query(self, title: str) -> str:
         """검색어 정제
