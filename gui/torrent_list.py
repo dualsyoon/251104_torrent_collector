@@ -9,6 +9,7 @@ from PySide6.QtGui import QDesktopServices, QPixmap, QIcon, QCursor
 from typing import List, Dict, Optional
 from database.models import Torrent
 from .image_loader import ImageCache, ImageDownloader
+from .settings_utils import load_ui_settings
 from config import IMAGE_CACHE_SIZE
 
 
@@ -48,21 +49,11 @@ class TorrentListWidget(QWidget):
         # UI 설정 (QSettings에서 불러오기)
         self.settings = QSettings()
         
-        # 기존 설정값 가져오기
-        saved_width = int(self.settings.value('ui/thumbnail_width', 120))
-        saved_height = int(self.settings.value('ui/row_height', 80))
-        
-        # 너무 큰 값이면 강제로 작은 값으로 변경 (한 번만)
-        if saved_width > 150:
-            saved_width = 120
-            self.settings.setValue('ui/thumbnail_width', 120)
-        if saved_height > 100:
-            saved_height = 80
-            self.settings.setValue('ui/row_height', 80)
-        
+        # 기존 동작(기본값/클램프)을 동일하게 적용
+        saved_width, saved_height, hover_preview = load_ui_settings(self.settings)
         self.thumbnail_col_width = saved_width
         self.row_height = saved_height
-        self.enable_hover_preview = self.settings.value('ui/hover_preview', True, type=bool)
+        self.enable_hover_preview = hover_preview
         # 미리보기 라벨 (오버레이)
         self.preview_label = None
         
