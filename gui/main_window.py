@@ -914,13 +914,30 @@ class ThumbnailUpdateThread(QThread):
                             title_text = temp_item.get('title', '') or torrent.title or ''
                             is_fc2 = is_fc2_title(title_text)
                             
+                            # 현재 활성화되고 차단되지 않은 서버만 확인
+                            # ImageFinder의 차단 상태를 기반으로 활성 서버 결정
+                            active_servers = set()
+                            if thread_finder.javdb_available:  # JAVDB가 차단되지 않았는지 확인
+                                active_servers.add('javdb')
+                            if not thread_finder.javbee_blocked:  # JAVBEE가 차단되지 않았는지 확인
+                                active_servers.add('javbee')
+                            if not thread_finder.javguru_blocked:  # JAVGURU가 차단되지 않았는지 확인
+                                active_servers.add('javguru')
+                            if not thread_finder.javmost_blocked:  # JAVMOST가 차단되지 않았는지 확인
+                                active_servers.add('javmost')
+                            # FC2PPV는 항상 사용 가능하다고 가정 (또는 다르게 처리)
+                            active_servers.add('fc2ppv')
+                            
                             # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST만 처리 가능
                             # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST만 처리 가능
                             # JAVGURU, JAVMOST는 모든 형태의 제목 검색 가능
                             if is_fc2:
-                                all_servers = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
+                                base_servers = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                             else:
-                                all_servers = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
+                                base_servers = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
+                            
+                            # 실제로 사용 가능한 서버만 필터링
+                            all_servers = base_servers & active_servers
                             
                             # 이미 이 서버에서 탐색했으면 다른 서버 확인
                             if server_name in searched_servers:
