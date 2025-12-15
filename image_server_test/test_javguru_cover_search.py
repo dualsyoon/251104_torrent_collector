@@ -32,6 +32,7 @@ from typing import Optional, Tuple, List, Dict
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 
 # ==========================
 # 설정
@@ -104,39 +105,51 @@ def save_debug_json(out_dir: str, keyword: str, debug: dict):
 # ==========================
 # HTTP & 네트워크
 # ==========================
-def create_http_client(prefer_cloudscraper: bool = True) -> requests.Session:
-    """
-    cloudscraper(가능하면) 우선, 실패 시 requests.Session
-    """
-    s = None
-    if prefer_cloudscraper:
-        try:
-            import cloudscraper  # pip install cloudscraper
-            s = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False}
-            )
-        except Exception:
-            s = None
-    if s is None:
-        s = requests.Session()
+REQUEST_DELAY = 1.0  # Playwright 요청 간 지연 시간
 
+def create_http_client() -> requests.Session:
+    """
+    이미지 다운로드용 requests.Session (Playwright는 HTML 수집용)
+    """
+    s = requests.Session()
     s.headers.update(
         {
             "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
             "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
             "DNT": "1",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
         }
     )
-    try:
-        s.get(BASE + "/", headers={"Referer": BASE + "/"}, timeout=15)
-    except Exception:
-        pass
     return s
+
+
+def get_html_playwright(url: str, page: Page, referer: str | None = None, max_retries: int = 3) -> str:
+    """
+    Playwright를 사용한 HTML 요청 (재시도 로직 포함)
+    """
+    for attempt in range(max_retries):
+        try:
+            time.sleep(REQUEST_DELAY)  # 요청 전 지연
+            if referer:
+                page.set_extra_http_headers({"Referer": referer})
+            
+            response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            
+            if response and response.status >= 400:
+                raise Exception(f"HTTP {response.status}")
+            
+            # 추가 대기 (동적 컨텐츠 로딩)
+            time.sleep(0.5)
+            
+            return page.content()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait_time = REQUEST_DELAY * (attempt + 2)
+            print(f"[retry {attempt + 1}/{max_retries}] 연결 실패, {wait_time:.1f}초 후 재시도... ({type(e).__name__})")
+            time.sleep(wait_time)
+    raise Exception("get_html_playwright: max retries exceeded")
 
 
 def head_or_small_get(url: str, session: requests.Session, referer: str) -> Dict[str, Optional[object]]:
@@ -165,37 +178,54 @@ def head_or_small_get(url: str, session: requests.Session, referer: str) -> Dict
 # ==========================
 # 검색(우선) & 파싱
 # ==========================
-def get_search_html(keyword: str, session: requests.Session, debug: dict) -> Tuple[Optional[str], Optional[str]]:
+def get_search_html(keyword: str, page: Page, debug: dict, save_html: bool = True) -> Tuple[Optional[str], Optional[str]]:
     """
-    기본 검색: /?s=<keyword>
+    기본 검색: /?s=<keyword> (Playwright 버전)
     """
     url = f"{BASE}/?{up.urlencode({'s': keyword})}"
     try:
-        r = session.get(url, headers={"Referer": BASE + "/"}, timeout=25, allow_redirects=True)
-        if r.status_code == 200 and len(r.text) > 500:
-            debug["search_html_status"] = r.status_code
+        html = get_html_playwright(url, page, referer=BASE + "/")
+        if html and len(html) > 500:
+            debug["search_html_status"] = 200
             debug["search_url"] = url
-            return r.text, url
-        debug["search_html_status"] = r.status_code
-        debug["search_html_len"] = len(r.text)
+            debug["search_html_length"] = len(html)
+            
+            # 디버그용 HTML 저장
+            if save_html:
+                os.makedirs("debug_html", exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                html_path = f"debug_html/search_{keyword}_{ts}.html"
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                debug["saved_search_html"] = html_path
+                print(f"[debug] 검색 HTML 저장 -> {html_path}")
+            
+            return html, url
+        debug["search_html_status"] = "empty"
+        debug["search_html_len"] = len(html) if html else 0
         return None, url
     except Exception as e:
         debug["search_html_error"] = repr(e)
         return None, url
 
 
-def find_first_card_and_title_from_search(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSoup], Optional[str]]:
+def find_first_card_and_title_from_search(soup: BeautifulSoup) -> Tuple[Optional[BeautifulSoup], Optional[str], Optional[str]]:
     """
-    검색 결과에서 첫 번째 카드(article)와 제목 텍스트 추출
+    검색 결과에서 첫 번째 카드, 제목, 링크 추출
+    JAV.GURU는 article 대신 .grid1, .grid2 클래스를 사용
+    검색 결과 카드에는 이미지가 없으므로 포스트 링크를 반환
     """
-    for art in soup.select("article"):
-        a = art.select_one("h2 a, h1 a, .entry-title a, a")
+    # JAV.GURU는 .grid1, .grid2 클래스의 div를 사용
+    for card in soup.select(".grid1, .grid2, .row > div"):
+        # h2 a 태그에서 제목과 링크 추출
+        a = card.select_one("h2 a, h1 a, .entry-title a, a")
         if not a:
             continue
         title_txt = (a.get_text(" ", strip=True) or "").strip()
-        if len(title_txt) >= 3:
-            return art, title_txt
-    return None, None
+        link = a.get("href", "")
+        if len(title_txt) >= 3 and link:
+            return card, title_txt, link
+    return None, None, None
 
 
 def collect_card_images(card_node, base_url: str) -> List[Dict[str, str]]:
@@ -243,15 +273,17 @@ def collect_card_images(card_node, base_url: str) -> List[Dict[str, str]]:
 # ==========================
 # 폴백: WP REST / RSS
 # ==========================
-def find_first_post_via_rest(keyword: str, session: requests.Session, debug: dict) -> Tuple[Optional[str], Optional[str]]:
+def find_first_post_via_rest(keyword: str, page: Page, debug: dict) -> Tuple[Optional[str], Optional[str]]:
     """
-    WP REST 검색: /wp-json/wp/v2/search?search=<keyword>
+    WP REST 검색: /wp-json/wp/v2/search?search=<keyword> (Playwright 버전)
     """
     api = f"{BASE}/wp-json/wp/v2/search?{up.urlencode({'search': keyword, 'per_page': 10})}"
     try:
-        r = session.get(api, headers={"Referer": BASE + "/"}, timeout=20)
-        if r.status_code == 200:
-            data = r.json()
+        html = get_html_playwright(api, page, referer=BASE + "/")
+        # JSON 응답 파싱
+        import json
+        data = json.loads(html)
+        if isinstance(data, list):
             for obj in data:
                 link = obj.get("url") or obj.get("link")
                 title = obj.get("title") or obj.get("title_plain") or ""
@@ -259,27 +291,26 @@ def find_first_post_via_rest(keyword: str, session: requests.Session, debug: dic
                     # REST title은 HTML 엔티티 포함 가능
                     title_text = BeautifulSoup(str(title), "html.parser").get_text(" ", strip=True)
                     return link, title_text
-        debug["rest_status"] = r.status_code
+        debug["rest_status"] = "ok"
     except Exception as e:
         debug["rest_error"] = repr(e)
     return None, None
 
 
-def find_first_post_via_rss(keyword: str, session: requests.Session, debug: dict) -> Tuple[Optional[str], Optional[str]]:
+def find_first_post_via_rss(keyword: str, page: Page, debug: dict) -> Tuple[Optional[str], Optional[str]]:
     """
-    RSS 검색: /?s=<keyword>&feed=rss2
+    RSS 검색: /?s=<keyword>&feed=rss2 (Playwright 버전)
     """
     feed = f"{BASE}/?{up.urlencode({'s': keyword, 'feed': 'rss2'})}"
     try:
-        r = session.get(feed, headers={"Referer": BASE + "/"}, timeout=20)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "xml")
-            item = soup.find("item")
-            if item:
-                link = item.findtext("link")
-                title = item.findtext("title")
-                return link, title
-        debug["rss_status"] = r.status_code
+        html = get_html_playwright(feed, page, referer=BASE + "/")
+        soup = BeautifulSoup(html, "xml")
+        item = soup.find("item")
+        if item:
+            link = item.findtext("link")
+            title = item.findtext("title")
+            return link, title
+        debug["rss_status"] = "ok"
     except Exception as e:
         debug["rss_error"] = repr(e)
     return None, None
@@ -397,79 +428,103 @@ def download_pipeline(
 # ==========================
 # 메인
 # ==========================
-def scrape_javguru(keyword: str, out_dir: str = "downloads"):
+def scrape_javguru(keyword: str, out_dir: str = "downloads", headless: bool = True):
     """
     1) /?s= 검색 페이지에서 첫 카드 이미지 시도
     2) 1이 막히면 WP REST → RSS 순서로 첫 포스트 URL 확보
        → 포스트 페이지에서 대표 이미지 수집
+    
+    Playwright 기반으로 봇 탐지 우회
     """
-    debug = {"keyword": keyword, "min_bytes": MIN_BYTES, "site": "jav.guru"}
+    debug = {"keyword": keyword, "min_bytes": MIN_BYTES, "site": "jav.guru", "mode": "playwright"}
     kw_re = compile_keyword_strict(keyword)
 
-    with create_http_client(prefer_cloudscraper=True) as s:
-        # 1) 검색 페이지 시도
-        search_html, search_url = get_search_html(keyword, s, debug)
-        if search_html:
-            soup = BeautifulSoup(search_html, "lxml")
-            card, title = find_first_card_and_title_from_search(soup)
-            debug["search_url"] = search_url
-            debug["card_title_text"] = title
+    # 이미지 다운로드용 세션 (requests)
+    download_session = create_http_client()
 
-            if card and title and kw_re.search(title):
-                imgs = collect_card_images(card, BASE)
-                debug["candidate_count_search"] = len(imgs)
-                debug["raw_candidates_search"] = imgs[:50]
-                if imgs:
-                    download_pipeline(keyword, out_dir, imgs, s, search_url, debug)
-                    save_debug_json(out_dir, keyword, debug)
-                    return
-                else:
-                    debug["warn"] = "no image on search card; fallback to post page"
-            else:
-                debug["warn"] = "title mismatch or no card; fallback to post page"
+    with sync_playwright() as p:
+        # 브라우저 실행 (Chromium)
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1920, "height": 1080},
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+        )
+        page = context.new_page()
 
-        # 2) 폴백: WP REST → RSS
-        post_url, post_title = find_first_post_via_rest(keyword, s, debug)
-        if not post_url:
-            post_url, post_title = find_first_post_via_rss(keyword, s, debug)
-
-        if not post_url or not post_title:
-            debug["error"] = "no_result_via_rest_rss"
-            save_debug_json(out_dir, keyword, debug)
-            print("no result via REST/RSS")
-            return
-
-        debug["post_url"] = post_url
-        debug["post_title_text"] = post_title
-
-        # 제목 엄격 매칭
-        if not kw_re.search(post_title or ""):
-            debug["error"] = "title_mismatch_on_post"
-            save_debug_json(out_dir, keyword, debug)
-            print("title mismatch on post")
-            return
-
-        # 포스트 페이지에서 대표 이미지 수집
         try:
-            pr = s.get(post_url, headers={"Referer": BASE + "/"}, timeout=25)
-            pr.raise_for_status()
-            post_imgs = collect_post_cover_images(pr.text, post_url)
-            debug["candidate_count_post"] = len(post_imgs)
-            debug["raw_candidates_post"] = post_imgs[:50]
+            # 1) 검색 페이지에서 링크 추출
+            search_html, search_url = get_search_html(keyword, page, debug, save_html=True)
+            post_url, post_title = None, None
+            
+            if search_html:
+                soup = BeautifulSoup(search_html, "lxml")
+                card, title, link = find_first_card_and_title_from_search(soup)
+                debug["search_url"] = search_url
+                debug["card_title_text"] = title
+                debug["card_link"] = link
+                
+                # 디버그: grid 요소 개수 확인
+                grids = soup.select(".grid1, .grid2")
+                debug["grid_count"] = len(grids)
+                print(f"[debug] grid 요소 발견: {len(grids)}개")
 
-            if not post_imgs:
-                debug["error"] = "no_cover_on_post"
+                # JAV.GURU 검색 결과 카드에는 이미지가 없으므로 바로 포스트 페이지로 이동
+                if card and title and link and kw_re.search(title):
+                    post_url = link
+                    post_title = title
+                    debug["method"] = "direct_from_search"
+                    print(f"[debug] 검색 결과에서 링크 추출: {post_url}")
+                else:
+                    debug["warn"] = "title mismatch or no card; fallback to REST/RSS"
+
+            # 2) 폴백: WP REST → RSS (검색 페이지에서 링크를 못 찾았을 때만)
+            if not post_url:
+                post_url, post_title = find_first_post_via_rest(keyword, page, debug)
+            if not post_url:
+                post_url, post_title = find_first_post_via_rss(keyword, page, debug)
+
+            if not post_url or not post_title:
+                debug["error"] = "no_result_via_rest_rss"
                 save_debug_json(out_dir, keyword, debug)
-                print("no cover on post")
+                print("no result via REST/RSS")
                 return
 
-            download_pipeline(keyword, out_dir, post_imgs, s, post_url, debug)
-            save_debug_json(out_dir, keyword, debug)
+            debug["post_url"] = post_url
+            debug["post_title_text"] = post_title
 
-        except Exception as e:
-            debug["error"] = f"post_fetch_error:{e!r}"
-            save_debug_json(out_dir, keyword, debug)
-            print("post fetch error")
+            # 제목 엄격 매칭
+            if not kw_re.search(post_title or ""):
+                debug["error"] = "title_mismatch_on_post"
+                save_debug_json(out_dir, keyword, debug)
+                print("title mismatch on post")
+                return
+
+            # 포스트 페이지에서 대표 이미지 수집
+            try:
+                post_html = get_html_playwright(post_url, page, referer=BASE + "/")
+                post_imgs = collect_post_cover_images(post_html, post_url)
+                debug["candidate_count_post"] = len(post_imgs)
+                debug["raw_candidates_post"] = post_imgs[:50]
+
+                if not post_imgs:
+                    debug["error"] = "no_cover_on_post"
+                    save_debug_json(out_dir, keyword, debug)
+                    print("no cover on post")
+                    return
+
+                download_pipeline(keyword, out_dir, post_imgs, download_session, post_url, debug)
+                save_debug_json(out_dir, keyword, debug)
+
+            except Exception as e:
+                debug["error"] = f"post_fetch_error:{e!r}"
+                save_debug_json(out_dir, keyword, debug)
+                print("post fetch error")
+        
+        finally:
+            browser.close()
+            download_session.close()
 
 
 # ==========================
@@ -477,6 +532,7 @@ def scrape_javguru(keyword: str, out_dir: str = "downloads"):
 # ==========================
 if __name__ == "__main__":
     # 동작 확인용 예시 (필요에 따라 수정)
-    scrape_javguru("ZSD-74", out_dir="test_images_javguru")
-    scrape_javguru("STARS-080", out_dir="test_images_javguru")
-    scrape_javguru("EBOD-203", out_dir="test_images_javguru")
+    print("🚀 Playwright를 사용하여 요청 중...")
+    scrape_javguru("THZA-05", out_dir="test_images_javguru", headless=True)
+    # scrape_javguru("STARS-080", out_dir="test_images_javguru", headless=True)
+    # scrape_javguru("EBOD-203", out_dir="test_images_javguru", headless=True)
