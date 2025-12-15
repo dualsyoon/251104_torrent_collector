@@ -1874,7 +1874,37 @@ class ImageFinder:
 
         # 1) 상세 URL 찾기
         view_url, title_text = resolve_view_url_and_title(keyword)
+        
+        # view_url을 못 찾았을 때 poster_guess만 시도
         if not view_url or not title_text:
+            # keyword에서 코드 추출하여 poster_guess 시도
+            prefix, _num, code = normalize_code(keyword)
+            if code:
+                # poster_guess: img{n}.javmost.com/images/{CODE}.webp
+                poster_cands = []
+                for n in ("3", "2", "1", "4", "5"):
+                    poster_cands.append(f"https://img{n}.javmost.com/images/{code}.webp")
+                
+                # 후보 검증
+                results = []
+                for u in poster_cands:
+                    probe = pw.probe_image(u, referer=BASE)
+                    if not probe.get("ok"):
+                        continue
+                    size_ok = (probe.get("size") is None) or (probe.get("size") >= MIN_BYTES)
+                    if not size_ok:
+                        continue
+                    ct = (probe.get("ct") or "").lower()
+                    if "gif" in ct:
+                        continue
+                    results.append(probe.get("final_url") or u)
+                    if len(results) >= 5:
+                        break
+                
+                if results:
+                    print(f"[JAVMOST] view_url 못 찾음 → poster_guess로 {len(results)}개 발견: {code}")
+                return results
+            
             return []
 
         # 2) 상세 HTML 가져오기 (403이면 카운트/차단/리셋)
@@ -1986,24 +2016,51 @@ class ImageFinder:
                 seen.add(u)
 
         results: List[str] = []
+        debug_filter = []  # 디버그: 필터링 과정 추적
+        
         for u in cands:
+            # 자산 필터
             if is_probably_asset(u):
+                debug_filter.append({"url": u[:80], "reason": "asset"})
                 continue
+            
+            # HTML 필터
             ext = pathlib.Path(urlparse(u).path).suffix.lower()
             if ext == ".html":
+                debug_filter.append({"url": u[:80], "reason": "html"})
                 continue
+            
+            # 이미지 검사 (네트워크 요청)
             probe = pw.probe_image(u, referer=view_url)
             if not probe.get("ok"):
+                debug_filter.append({"url": u[:80], "reason": f"not_image(ct={probe.get('ct', 'N/A')})"})
                 continue
+            
+            # 크기 검사
             size_ok = (probe.get("size") is None) or (probe.get("size") >= MIN_BYTES)
             if not size_ok:
+                debug_filter.append({"url": u[:80], "reason": f"small({probe.get('size')})"})
                 continue
+            
+            # GIF 제외
             ct = (probe.get("ct") or "").lower()
             if "gif" in ct:
+                debug_filter.append({"url": u[:80], "reason": "gif"})
                 continue
-            results.append(probe.get("final_url") or u)
+            
+            # 통과!
+            final_url = probe.get("final_url") or u
+            results.append(final_url)
+            debug_filter.append({"url": u[:80], "reason": "✅ accepted", "final": final_url[:80]})
+            
             if len(results) >= 5:
                 break
+
+        # 디버그 출력 (검색 실패 시에만)
+        if not results and cands:
+            print(f"[JAVMOST] 후보 {len(cands)}개 중 통과한 이미지 없음:")
+            for item in debug_filter[:10]:  # 처음 10개만 출력
+                print(f"  - {item['url']} → {item['reason']}")
 
         return results
     

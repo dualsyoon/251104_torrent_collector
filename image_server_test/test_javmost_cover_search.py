@@ -775,7 +775,7 @@ if __name__ == "__main__":
     # Playwright 버전 사용 (봇 차단 우회)
     print("🚀 Playwright를 사용하여 요청 중...")
     urls = scrape_javmost_image_urls_by_keyword(
-        "JERA-018",            # 예시 키워드
+        "GVG-849",            # 예시 키워드
         out_dir="test_images",
         download=False,       # URL만(저장 X)
         headless=True,        # 헤드리스 모드 (False로 변경하면 브라우저 UI 표시)
