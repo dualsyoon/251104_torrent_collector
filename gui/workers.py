@@ -50,18 +50,10 @@ class SingleThumbnailReplaceThread(QThread):
                     except Exception:
                         pass
 
-                # DB에서 이미 탐색한 서버 목록 확인
-                import json
-
-                searched_servers = []
-                if t.thumbnail_searched_servers:
-                    try:
-                        searched_servers = json.loads(t.thumbnail_searched_servers)
-                    except (json.JSONDecodeError, TypeError):
-                        searched_servers = []
-
-                # 탐색하지 않은 서버만 검색 (교체 시 우선 탐색)
-                exclude_servers = searched_servers.copy()  # 이미 탐색한 서버는 제외
+                # 썸네일 교체는 이미 검색한 서버에서 "다른 썸네일"을 찾는 것이 목적
+                # 따라서 searched_servers를 exclude_servers로 사용하지 않음
+                # 대신 현재 썸네일의 호스트만 exclude_hosts로 제외 (위에서 이미 처리)
+                exclude_servers = None  # 모든 서버에서 검색
 
                 # ImageFinder 재사용 (없으면 새로 생성)
                 if self.image_finder is None:

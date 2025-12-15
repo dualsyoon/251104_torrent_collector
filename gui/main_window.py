@@ -896,11 +896,14 @@ class ThumbnailUpdateThread(QThread):
                             if not torrent:
                                 return None, None
                             
-                            # 이미 썸네일이 있으면 스킵 (단, force_replace 플래그가 있으면 검색)
+                            # force_replace 플래그가 있으면 무조건 현재 서버에서 처리 (썸네일 교체)
+                            # searched_servers 체크 없이 바로 처리
+                            if temp_item.get('force_replace', False):
+                                return temp_item, 'ok'
+                            
+                            # 이미 썸네일이 있으면 스킵
                             if torrent.thumbnail_url and torrent.thumbnail_url.strip():
-                                # force_replace 플래그가 있으면 썸네일이 있어도 검색 (교체 기능)
-                                if not temp_item.get('force_replace', False):
-                                    return None, 'has_thumbnail'
+                                return None, 'has_thumbnail'
                             
                             # DB에서 이미 탐색한 서버 목록 확인
                             searched_servers = []
@@ -2591,6 +2594,9 @@ class ThumbnailUpdateThread(QThread):
                                             
                                             # 현재 페이지 항목이면 GUI 즉시 업데이트 (우선순위 리스트 또는 현재 페이지 항목)
                                             if is_priority or (hasattr(self, 'priority_ids') and torrent_id in self.priority_ids):
+                                                # force_replace 항목이면 로그 출력
+                                                if item.get('force_replace', False):
+                                                    print(f"[썸네일 교체] ✅ ID {torrent_id} 썸네일 발견, 시그널 발생")
                                                 self.thumbnail_updated.emit(torrent_id, thumbnail_url)
                                             
                                             # 세션 닫기 (DB_writer가 별도 세션에서 처리)
@@ -2610,6 +2616,9 @@ class ThumbnailUpdateThread(QThread):
                                             
                                             # 현재 페이지 항목이면 GUI 즉시 업데이트 (우선순위 리스트 또는 현재 페이지 항목)
                                             if is_priority or (hasattr(self, 'priority_ids') and torrent_id in self.priority_ids):
+                                                # force_replace 항목이면 로그 출력
+                                                if item.get('force_replace', False):
+                                                    print(f"[썸네일 교체] ✅ ID {torrent_id} 썸네일 발견, 시그널 발생")
                                                 self.thumbnail_updated.emit(torrent_id, thumbnail_url)
                                             
                                             # 세션 닫기
@@ -2734,6 +2743,11 @@ class ThumbnailUpdateThread(QThread):
                                             torrent_status[torrent_id]['found'] = False
                                             with completed_lock:
                                                 completed_torrents.add(torrent_id)
+                                        
+                                        # 우선순위 항목이나 force_replace 항목인 경우 시그널 발생 (버튼 활성화를 위해)
+                                        # 빈 URL로 시그널 발생하여 처리 완료를 알림
+                                        if is_priority or (hasattr(self, 'priority_ids') and torrent_id in self.priority_ids):
+                                            self.thumbnail_updated.emit(torrent_id, '')
                                     
                                     if used_queue != 'priority_list' and hasattr(used_queue, 'task_done'):
                                         used_queue.task_done()
@@ -2926,13 +2940,13 @@ class ThumbnailUpdateThread(QThread):
                                                                         is_fc2_priority_debug = True
                                                                         break
                                                             
-                                                            # FC2 항목: FC2PPV, JAVDB, NYAA만 처리 가능
-                                                            # FC2가 아닌 항목: JAVDB, JAVBEE, NYAA만 처리 가능
-                                                            # NYAA는 모든 형태의 품번 검색 가능
+                                                            # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST 처리 가능
+                                                            # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST 처리 가능
+                                                            # JAVGURU, JAVMOST는 모든 형태의 제목 검색 가능
                                                             if is_fc2_priority_debug:
-                                                                all_servers_priority_debug = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                                                all_servers_priority_debug = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                                                             else:
-                                                                all_servers_priority_debug = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                                                all_servers_priority_debug = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                                                             
                                                             remaining_servers_priority_debug = all_servers_priority_debug - set(searched_servers_priority_debug)
                                                             
@@ -2991,12 +3005,13 @@ class ThumbnailUpdateThread(QThread):
                                                                         is_fc2_debug = True
                                                                         break
                                                             
-                                                            # FC2 항목: FC2PPV, JAVDB, JAVGURU만 처리 가능
-                                                            # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU만 처리 가능
+                                                            # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST 처리 가능
+                                                            # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST 처리 가능
+                                                            # JAVGURU, JAVMOST는 모든 형태의 제목 검색 가능
                                                             if is_fc2_debug:
-                                                                all_servers_debug = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                                                all_servers_debug = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                                                             else:
-                                                                all_servers_debug = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                                                all_servers_debug = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                                                             
                                                             remaining_servers_debug = all_servers_debug - set(searched_servers_debug)
                                                             
@@ -4169,12 +4184,12 @@ class MainWindow(QMainWindow):
                                         is_fc2_debug = True
                                         break
                             
-                            # FC2 항목: FC2PPV, JAVDB, JAVGURU만 처리 가능
-                            # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU만 처리 가능
+                            # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST 처리 가능
+                            # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST 처리 가능
                             if is_fc2_debug:
-                                all_servers_debug = {'fc2ppv', 'javdb', 'javguru'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU
+                                all_servers_debug = {'fc2ppv', 'javdb', 'javguru', 'javmost'}  # FC2 항목: FC2PPV, JAVDB, JAVGURU, JAVMOST
                             else:
-                                all_servers_debug = {'javdb', 'javbee', 'javguru'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU
+                                all_servers_debug = {'javdb', 'javbee', 'javguru', 'javmost'}  # FC2가 아닌 항목: JAVDB, JAVBEE, JAVGURU, JAVMOST
                             
                             remaining_servers_debug = all_servers_debug - set(searched_servers_debug)
                             
@@ -4198,7 +4213,35 @@ class MainWindow(QMainWindow):
             # 비동기로 디버그 정보 출력 (UI 블로킹 방지)
             QTimer.singleShot(0, print_debug_info)
             
-            # 모든 처리를 비동기로 실행하여 UI 블로킹 방지
+            # 1단계: 먼저 기존 썸네일 URL을 NULL로 변경 (즉시 DB + GUI 반영)
+            def clear_thumbnail_async():
+                try:
+                    # DB에서 썸네일 URL을 NULL로 변경
+                    if self.db_writer:
+                        self.db_writer.update_thumbnail(torrent_id, None)
+                        print(f"[썸네일 교체] ID {torrent_id} 기존 썸네일 제거 (NULL 설정)")
+                    else:
+                        # DB_writer가 없으면 직접 변경
+                        session = self.db.get_session()
+                        try:
+                            from database.models import Torrent
+                            torrent = session.get(Torrent, torrent_id)
+                            if torrent:
+                                torrent.thumbnail_url = None
+                                session.commit()
+                                print(f"[썸네일 교체] ID {torrent_id} 기존 썸네일 제거 (NULL 설정)")
+                        finally:
+                            session.close()
+                    
+                    # GUI에도 즉시 반영 (썸네일 제거)
+                    QTimer.singleShot(0, lambda: self.torrent_list.update_thumbnail_by_id(torrent_id, ''))
+                except Exception as e:
+                    print(f"[썸네일 교체] 기존 썸네일 제거 오류: {e}")
+            
+            # 즉시 썸네일 제거
+            QTimer.singleShot(0, clear_thumbnail_async)
+            
+            # 2단계: 모든 처리를 비동기로 실행하여 UI 블로킹 방지
             def process_replace_async():
                 # 백그라운드 썸네일 업데이트가 실행 중이면 우선순위 큐에 최우선으로 추가
                 if self.thumbnail_thread and self.thumbnail_thread.isRunning():
@@ -4210,16 +4253,21 @@ class MainWindow(QMainWindow):
                     
                     # 비동기로 우선순위 큐에 최우선으로 추가
                     def update_priority_async():
+                        print(f"[썸네일 교체] ID {torrent_id}를 우선순위 큐에 최우선 추가 (force_replace=True)")
                         self.thumbnail_thread.update_priority_ids([torrent_id], force_first=True)
                     QTimer.singleShot(0, update_priority_async)
                     
-                    # 타임아웃 설정: 30초 후에도 버튼이 활성화되지 않으면 자동 활성화
+                    # 타임아웃 설정: 60초 후에도 버튼이 활성화되지 않으면 자동 활성화
+                    # (여러 서버를 순회하며 검색하므로 충분한 시간 필요)
                     def timeout_handler():
                         if torrent_id in self.pending_replace_ids:
-                            print(f"[썸네일 교체] 타임아웃: ID {torrent_id} 버튼 자동 활성화")
+                            print(f"[썸네일 교체] ⚠️ 타임아웃 (60초): ID {torrent_id} 버튼 자동 활성화")
+                            print(f"  - 썸네일 검색이 완료되지 않았거나 시그널이 전달되지 않았습니다.")
                             self.torrent_list.enable_replace_button(torrent_id)
                             self.pending_replace_ids.discard(torrent_id)
-                    QTimer.singleShot(30000, timeout_handler)  # 30초 후
+                            # 상태바 메시지
+                            QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"⚠️ 썸네일 교체 타임아웃 (ID: {torrent_id})", 3000))
+                    QTimer.singleShot(60000, timeout_handler)  # 60초 후
                 else:
                     # 백그라운드 업데이트가 없으면 기존 방식으로 처리
                     self.replace_queue.put(torrent_id)
