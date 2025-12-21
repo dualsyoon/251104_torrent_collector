@@ -87,18 +87,26 @@ class ImageFinder:
 
     def _safe_get(self, url: str, headers: Optional[dict] = None, params: Optional[dict] = None, timeout: Optional[int] = None):
         """간단한 재시도 포함 GET 요청"""
-        last_exc = None
         tries = min(self.http_retries + 1, 2)  # 최대 2회 시도로 제한하여 속도 개선
-        for _ in range(tries):
+        for attempt in range(tries):
             try:
                 resp = self.session.get(url, headers=headers, params=params, timeout=timeout or self.http_timeout)
                 return resp
-            except (ConnectionError, Timeout, RequestException) as e:
-                last_exc = e
-                time.sleep(0.1)  # 대기 시간 단축
-                continue
-        if last_exc:
-            raise last_exc
+            except Timeout:
+                if attempt == tries - 1:
+                    # 마지막 시도 실패 시 간단한 에러 메시지만 출력
+                    print(f"[HTTP] 타임아웃: {url[:80]}...")
+                time.sleep(0.1)
+            except ConnectionError:
+                if attempt == tries - 1:
+                    # 마지막 시도 실패 시 간단한 에러 메시지만 출력
+                    print(f"[HTTP] 연결 실패: {url[:80]}...")
+                time.sleep(0.1)
+            except RequestException as e:
+                if attempt == tries - 1:
+                    # 마지막 시도 실패 시 간단한 에러 메시지만 출력
+                    print(f"[HTTP] 요청 실패: {url[:80]}... ({type(e).__name__})")
+                time.sleep(0.1)
         return None
     
     def search_images(self, title: str, max_images: int = 5, exclude_hosts: List[str] = None, exclude_servers: List[str] = None) -> dict:
@@ -469,6 +477,57 @@ class ImageFinder:
             else:  # 없으면 FC2-숫자
                 codes.append(f"FC2-{fc2_num}")
         
+        # Caribbean(Carib) 패턴 (예: 121925-001-CARIB, CARIBBEANCOM-121925-001)
+        # Caribbean은 다른 패턴보다 우선 처리 (더 구체적인 패턴)
+        # 형식 1: MMDDYY-XXX-CARIB (접미사 형태)
+        pattern_carib_suffix = r'(\d{6})[-\s](\d{3})[-\s]CARIB(?:BEAN)?(?:COM)?'
+        matches_carib_suffix = re.findall(pattern_carib_suffix, title_upper)
+        carib_codes = []  # Caribbean 품번을 별도로 저장
+        for match in matches_carib_suffix:
+            date_part, num_part = match
+            carib_code = f"{date_part}-{num_part}"
+            carib_codes.append(carib_code)
+            codes.append(carib_code)
+        
+        # 형식 2: CARIBBEANCOM-MMDDYY-XXX 또는 CARIB-MMDDYY-XXX (접두사 형태)
+        pattern_carib_prefix = r'CARIB(?:BEAN)?(?:COM)?[-\s](\d{6})[-\s](\d{3})'
+        matches_carib_prefix = re.findall(pattern_carib_prefix, title_upper)
+        for match in matches_carib_prefix:
+            date_part, num_part = match
+            carib_code = f"{date_part}-{num_part}"
+            # 이미 추가된 코드인지 확인 (중복 방지)
+            if carib_code not in codes:
+                carib_codes.append(carib_code)
+                codes.append(carib_code)
+        
+        # N + 4자리 숫자 패턴 (예: N0877, N1234)
+        # N으로 시작하고 정확히 4자리 숫자만 허용
+        pattern_n_code = r'N(\d{4})(?=[^\d]|$)'
+        matches_n_code = re.findall(pattern_n_code, title_upper)
+        for match in matches_n_code:
+            n_code = f"N{match}"
+            if n_code not in codes:
+                codes.append(n_code)
+        
+        # Pacopacomama, 10musume, Caribbeancom PR 등 일본 스튜디오 패턴
+        # 형식: MMDDYY_NNN-STUDIO 또는 MMDDYY-NNN-STUDIO
+        # 예: 122025_100-PACO, 122025_01-10MU, 121925-001-CARIB
+        studio_patterns = [
+            (r'(\d{6})[_-](\d{2,4})[_-](PACO|PACOPACOMAMA)', 'Pacopacomama'),
+            (r'(\d{6})[_-](\d{2,4})[_-](10MU|10MUSUME)', '10musume'),
+            (r'(\d{6})[_-](\d{2,4})[_-](1PON|1PONDO)', '1pondo'),
+            (r'(\d{6})[_-](\d{2,4})[_-](CARIB(?:BEAN)?(?:COM)?PR)', 'Caribbeancom PR'),
+        ]
+        
+        for pattern, studio_name in studio_patterns:
+            matches_studio = re.findall(pattern, title_upper)
+            for match in matches_studio:
+                date_part, num_part, studio_part = match
+                # 표준 형식으로 정규화: MMDDYY-NNN (스튜디오명 제외)
+                studio_code = f"{date_part}-{num_part}"
+                if studio_code not in codes:
+                    codes.append(studio_code)
+        
         # 숫자-문자-숫자 패턴 (예: 4017-PPV147, 4092-PPV352, 4092-PPV-352)
         # 숫자로 시작하는 패턴을 먼저 확인 (더 구체적인 코드일 가능성이 높음)
         pattern_num_alpha_num = r'(\d{3,5})[-\s]?([A-Z]{2,10})[-\s]?(\d{3,6})(?=[^\w]|$)'
@@ -503,7 +562,8 @@ class ImageFinder:
                     codes.append(code)
         
         # 문자-숫자-문자 패턴 (예: MXNB-001S, IPX-123A) - 숫자 뒤에 문자가 있는 경우
-        pattern_av_suffix = r'([A-Z]{1,10})[-\s]?(\d{3,6})[-\s]?([A-Z]{1,3})(?=[^\w]|$)'
+        # suffix는 최대 1~2자리로 제한 (IPX가 suffix인 경우는 거의 없음)
+        pattern_av_suffix = r'([A-Z]{1,10})[-\s]?(\d{3,6})[-\s]?([A-Z]{1,2})(?=[^\w]|$)'
         matches_av_suffix = re.finditer(pattern_av_suffix, title_upper)
         
         for match_obj in matches_av_suffix:
@@ -511,8 +571,19 @@ class ImageFinder:
             # 원본 형식 그대로 사용 (대문자로 변환, 공백은 하이픈으로)
             code = match_obj.group(0).replace(' ', '-').upper()
             
+            # 이미 추가된 코드와 중복 체크
+            if any(c.upper() == code.upper() for c in codes):
+                continue
+            # 현재 코드가 이미 추출된 더 긴 코드에 포함되는 경우 제외
+            if any(code.upper() in c.upper() and len(code) < len(c) for c in codes):
+                continue
+            
             # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
-            if prefix not in excluded_alpha:
+            # prefix와 suffix 모두 체크 (HD, 4K 등 제외)
+            if prefix not in excluded_alpha and suffix not in excluded_alpha:
+                # N으로 시작하는 경우 제외 (N + 4자리 숫자만 유효하므로)
+                if prefix == 'N' and len(prefix) == 1:
+                    continue
                 # 숫자가 너무 작거나 크면 제외 (작품번호는 보통 3-6자리)
                 if len(number) >= 3 and len(number) <= 6:
                     codes.append(code)
@@ -535,16 +606,30 @@ class ImageFinder:
             # 원본 형식 그대로 사용 (공백은 그대로 유지, 대소문자도 원본 유지)
             code = match_obj.group(0)
             
-            # 이미 문자-숫자-문자 패턴으로 추가된 코드는 제외 (대소문자 구분 없이 비교)
+            # 이미 추가된 코드와 중복 체크
+            # 1. 완전히 동일한 코드 제외
             if any(c.upper() == code.upper() for c in codes):
+                continue
+            # 2. 현재 코드가 이미 추출된 더 긴 코드에 포함되는 경우 제외
+            # (예: "DCV-293"는 "277DCV-293"에 포함되므로 제외)
+            if any(code.upper() in c.upper() and len(code) < len(c) for c in codes):
                 continue
             
             # 제외 목록에 없고, 실제 작품번호처럼 보이는 것만 추가
-            # prefix와 전체 code 모두 체크 (FC2, Heydouga는 이미 별도 패턴으로 처리되므로 제외)
+            # prefix와 전체 code 모두 체크 (FC2, Heydouga, Caribbean, N코드는 이미 별도 패턴으로 처리되므로 제외)
             if prefix.upper() not in excluded_alpha and code.upper() not in excluded_codes:
-                # FC2, Heydouga는 이미 별도 패턴으로 처리했으므로 일반 패턴에서는 제외
-                if prefix.upper() in ('FC2', 'HEYDOUGA'):
+                # FC2, Heydouga, Caribbean은 이미 별도 패턴으로 처리했으므로 일반 패턴에서는 제외
+                if prefix.upper() in ('FC2', 'HEYDOUGA', 'CARIB', 'CARIBBEAN', 'CARIBBEANCOM', 'RIBBEANCOM'):
                     continue
+                # N으로 시작하는 경우: N + 4자리 숫자만 별도 패턴으로 처리, 나머지는 일반 패턴에서 제외
+                # (예: N0877은 별도 패턴, N12345나 N123은 유효하지 않음)
+                if prefix.upper() == 'N' and len(prefix) == 1 and not suffix_num:
+                    # N + 정확히 4자리 숫자는 별도 패턴에서 처리
+                    if len(number) == 4:
+                        continue
+                    # N + 4자리가 아닌 숫자는 유효하지 않은 품번이므로 제외
+                    else:
+                        continue
                 # 숫자가 너무 작거나 크면 제외 (작품번호는 보통 3-6자리)
                 if len(number) >= 3 and len(number) <= 6:
                     # suffix_num이 있으면 더 긴 코드를 우선시 (예: heydouga 4144-051)
@@ -553,9 +638,27 @@ class ImageFinder:
         
         # 중복 제거 및 더 긴 코드 우선 정렬
         # 예: "heydouga 4144"와 "heydouga 4144-051"이 모두 있으면 더 긴 것을 우선
+        # "277DCV-293"와 "DCV-293"가 있으면 더 긴 "277DCV-293"를 우선
         unique_codes = {}
         for code in codes:
-            # 같은 prefix로 시작하는 코드 중 더 긴 것을 우선 (대소문자 구분 없이)
+            # Caribbean 품번은 숫자로 시작하므로 별도 처리 (항상 보존)
+            if code in carib_codes:
+                # Caribbean 품번은 특수 키로 저장 (고유성 보장)
+                unique_codes[f"CARIB_{code}"] = code
+                continue
+            
+            # 숫자-문자-숫자 패턴 (예: 277DCV-293, 546EROFV-348)
+            # 숫자로 시작하는 경우 문자 부분을 prefix로 사용
+            num_alpha_match = re.match(r'^(\d+)[-\s]?([A-Za-z]+)', code, re.IGNORECASE)
+            if num_alpha_match:
+                # 숫자와 문자를 조합한 고유 키 사용
+                num_part, alpha_part = num_alpha_match.groups()
+                prefix = f"NUM_{alpha_part.upper()}"
+                if prefix not in unique_codes or len(code) > len(unique_codes[prefix]):
+                    unique_codes[prefix] = code
+                continue
+            
+            # 일반적인 문자로 시작하는 코드 (예: DCV-293, IPX-123)
             prefix_match = re.match(r'^([A-Za-z]+)', code, re.IGNORECASE)
             if prefix_match:
                 prefix = prefix_match.group(1).upper()  # 비교를 위해 대문자로 변환
@@ -828,7 +931,7 @@ class ImageFinder:
             urls = self._search_javlibrary(code)
             image_urls.extend(urls)
         except Exception as e:
-            print(f"[ImageFinder] JAVLibrary 검색 실패: {e}")
+            print(f"[ImageFinder] JAVLibrary 검색 실패: {type(e).__name__}")
         
         # 2. JAVDB 검색 (백업 - 설정 및 가용 여부 확인)
         if not image_urls and self.javdb_available and self.enable_javdb:
@@ -2982,9 +3085,7 @@ class ImageFinder:
             
         except Exception as e:
             display_title = title[:50] + "..." if title and len(title) > 50 else (title or query.strip())
-            print(f"[ImageFinder] JAVBee 검색 실패 (제목: {display_title}): {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ImageFinder] JAVBee 검색 실패 (제목: {display_title}): {type(e).__name__}")
             return []
     
     def __del__(self):
@@ -3074,7 +3175,7 @@ class ImageFinder:
             return image_urls[:max_results]
             
         except Exception as e:
-            print(f"[ImageFinder] Bing 검색 실패: {e}")
+            print(f"[ImageFinder] Bing 검색 실패: {type(e).__name__}")
             return []
     
     # DuckDuckGo 이미지 검색도 성인 컨텐츠 필터링으로 인해 비활성화

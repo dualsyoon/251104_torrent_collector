@@ -14,8 +14,8 @@ ENABLE_THUMBNAIL = os.getenv('ENABLE_THUMBNAIL', 'true').lower() == 'true'  # �
 MAX_CONSECUTIVE_DUPLICATES = int(os.getenv('MAX_CONSECUTIVE_DUPLICATES', '3'))  # 중복 발견 시 중단할 연속 페이지 수
 ENABLE_JAVDB_FALLBACK = os.getenv('ENABLE_JAVDB_FALLBACK', 'true').lower() == 'true'  # JAVDB 보조 검색 사용
 ENABLE_SELENIUM_FOR_IMAGES = os.getenv('ENABLE_SELENIUM_FOR_IMAGES', 'true').lower() == 'true'  # 이미지 검색에 셀레니움 사용
-IMAGE_HTTP_TIMEOUT = int(os.getenv('IMAGE_HTTP_TIMEOUT', '10'))  # 이미지/검색 HTTP 타임아웃(초)
-IMAGE_HTTP_RETRIES = int(os.getenv('IMAGE_HTTP_RETRIES', '2'))  # 검색 요청 재시도 횟수
+IMAGE_HTTP_TIMEOUT = int(os.getenv('IMAGE_HTTP_TIMEOUT', '20'))  # 이미지/검색 HTTP 타임아웃(초) - 느린 서버 대응
+IMAGE_HTTP_RETRIES = int(os.getenv('IMAGE_HTTP_RETRIES', '3'))  # 검색 요청 재시도 횟수 - 안정성 향상
 THUMBNAIL_SERVER_BLOCK_THRESHOLD = int(os.getenv('THUMBNAIL_SERVER_BLOCK_THRESHOLD', '200'))  # 썸네일 서버 정지 기준 (연속 실패 횟수)
 PROXY_URL = os.getenv('PROXY_URL', '')  # 셀레니움/요청용 프록시 (예: http://127.0.0.1:7890 또는 socks5://127.0.0.1:1080)
 

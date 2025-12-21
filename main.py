@@ -1,14 +1,30 @@
 """토렌트 수집기 메인 애플리케이션"""
 import sys
+import os
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
 from gui import MainWindow
 
 
 def main():
     """애플리케이션 진입점"""
+    # Windows 작업표시줄 아이콘 설정 (AppID)
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            # 고유한 AppID 설정 (작업표시줄 그룹화)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('TorrentCollector.App.1.0')
+        except:
+            pass
+    
     app = QApplication(sys.argv)
     app.setApplicationName("토렌트 수집기")
     app.setOrganizationName("TorrentCollector")
+    
+    # 애플리케이션 아이콘 설정
+    icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     
     # 시스템 트레이 사용 시 마지막 창이 닫혀도 앱이 종료되지 않도록 설정
     app.setQuitOnLastWindowClosed(False)

@@ -3115,6 +3115,13 @@ class MainWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
+        
+        # 윈도우 아이콘 설정
+        import os
+        icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icon.ico')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        
         self.db = Database()
         self.scraper_manager = ScraperManager()
         self.scraper_thread = None
